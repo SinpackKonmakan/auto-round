@@ -160,14 +160,14 @@ def quant_tensor_k_quant_torch(data, num_bits=4, group_size=32):
  
     best_mad = torch.sum(weights * diff ** 2, dim=1, keepdim=True)  # (nb, 1)
     
-    if num_bits== 4:
-        nstep = 20
-        rdelta = 0.1
-        rrmin = -1
-    elif num_bits == 2:
-        nstep = 15
-        rdelta = 0.1
-        rrmin = -0.5
+    # if num_bits== 4:
+    nstep = 20
+    rdelta = 0.1
+    rrmin = -1
+    # elif num_bits == 2:
+    #     nstep = 15
+    #     rdelta = 0.1
+    #     rrmin = -0.5
  
     for is_ in range(nstep):
         iscale_new = torch.ones_like(rmax, dtype=data.dtype)  # (nb, 1)

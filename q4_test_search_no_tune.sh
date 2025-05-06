@@ -10,8 +10,8 @@ CUDA_VISIBLE_DEVICES=$device python -m auto_round \
         --bits 4 \
         --iters 200 \
         --model /models/${model_name} \
-        --output_dir /data5/shiqi/gguf_${format}_${model_name}_search \
+        --output_dir /data5/shiqi/model/q4_${format}_${model_name}_search_nt_ns20_20times \
         --eval_bs 16 \
         --tasks arc_challenge,arc_easy,boolq,hellaswag,lambada_openai,mmlu,openbookqa,piqa,truthfulqa_mc1,winogrande \
-        2>&1 | tee /data5/shiqi/log/gguf_test/gguf_${format}_${model_name}_search_no_tune.log
+        2>&1 | tee /data5/shiqi/log/q4_${format}_${model_name}_search_nt_ns20_20times.log
 done
