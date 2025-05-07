@@ -1396,6 +1396,9 @@ class AutoRound(object):
         total_loss = 0
 
         for i in range(self.iters):
+            for n, m in block.named_modules():
+                if isinstance(m, WrapperLinear):
+                    setattr(m, "cur_iter", i)
             total_loss = 0
             if self.sampler == "rand":
                 whole_indices = torch.randperm(nsamples)[:pick_samples]
@@ -1418,7 +1421,6 @@ class AutoRound(object):
                 current_output = torch.cat(current_output, dim=self.batch_dim)
 
                 current_output = to_device(current_output, device)
-
                 output_q = block_forward(
                     block, current_input_ids, current_input_others, self.amp, self.amp_dtype, device
                 )
@@ -1441,7 +1443,6 @@ class AutoRound(object):
                 if not self.not_use_best_mse:
                     best_params = collect_best_params(block)
                     # print(f"get better result at iter {i}, the loss is {total_loss}", flush=True)
-
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
                 best_params = collect_best_params(block)
@@ -1465,6 +1466,7 @@ class AutoRound(object):
             logger.info(f"{unquantized_layer_names} have not been quantized")
         with torch.no_grad():
             unwrapper_block(block, best_params)
+            # assert torch.sum(torch.sum(best_params))>0
         if self.enable_quanted_input:
             if self.low_cpu_mem_usage:
                 block = block.to(device)
