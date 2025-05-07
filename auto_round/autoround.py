@@ -163,6 +163,9 @@ class AutoRound(object):
             super_bits: int = None,
             super_group_size: int = None,
             model_kwargs: dict = None,
+            rrmin: float = -1,
+            rdelta: float = 0.1,
+            nstep: int = 20,
             **kwargs,
     ):
         self.quantized = False
@@ -190,6 +193,11 @@ class AutoRound(object):
         self.nblocks = nblocks
         self.dataset = dataset
         self.iters = iters
+
+        self.rrmin = rrmin
+        self.rdelta = rdelta
+        self.nstep = nstep
+
         if self.iters < 0:
             logger.warning("`iters` must be non-negative, reset it to 200")
             self.iters = 200
@@ -598,7 +606,7 @@ class AutoRound(object):
                 block_names,
                 nblocks=self.nblocks,
                 device=self.device,
-                pbar=pbar
+                pbar=pbar,
             )
             if self.is_packing_immediate:
                 assert len(self.formats) == 1
@@ -1344,7 +1352,7 @@ class AutoRound(object):
             input_ids = q_input
 
         quantized_layer_names, unquantized_layer_names = wrapper_block(
-            block, self.enable_minmax_tuning, self.enable_norm_bias_tuning, device=self.device)
+            block, self.enable_minmax_tuning, self.enable_norm_bias_tuning, device=self.device, rrmin=self.rrmin, rdelta=self.rdelta, nstep=self.nstep)
 
         round_params = []
         minmax_params = []
@@ -1396,6 +1404,9 @@ class AutoRound(object):
         total_loss = 0
 
         for i in range(self.iters):
+            for n, m in block.named_modules():
+                if isinstance(m, WrapperLinear):
+                    setattr(m, "cur_iter", i)
             total_loss = 0
             if self.sampler == "rand":
                 whole_indices = torch.randperm(nsamples)[:pick_samples]
@@ -1418,7 +1429,6 @@ class AutoRound(object):
                 current_output = torch.cat(current_output, dim=self.batch_dim)
 
                 current_output = to_device(current_output, device)
-
                 output_q = block_forward(
                     block, current_input_ids, current_input_others, self.amp, self.amp_dtype, device
                 )
@@ -1441,7 +1451,6 @@ class AutoRound(object):
                 if not self.not_use_best_mse:
                     best_params = collect_best_params(block)
                     # print(f"get better result at iter {i}, the loss is {total_loss}", flush=True)
-
                     last_best_iter = i
             if self.not_use_best_mse and i == self.iters - 1:
                 best_params = collect_best_params(block)
@@ -1465,6 +1474,7 @@ class AutoRound(object):
             logger.info(f"{unquantized_layer_names} have not been quantized")
         with torch.no_grad():
             unwrapper_block(block, best_params)
+            # assert torch.sum(torch.sum(best_params))>0
         if self.enable_quanted_input:
             if self.low_cpu_mem_usage:
                 block = block.to(device)
@@ -1496,7 +1506,7 @@ class AutoRound(object):
             block_names,
             nblocks=1,
             device="cpu",
-            pbar=None
+            pbar=None,
     ):
         """Quantize and dequantize the weights of the specified blocks in the model.
 

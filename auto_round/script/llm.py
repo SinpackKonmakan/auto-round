@@ -191,6 +191,15 @@ class BasicArgumentParser(argparse.ArgumentParser):
  
         self.add_argument(
             "--super_bits", default=None, type=int, help="number of scale and mins quant bits for double quant.")
+
+        self.add_argument(
+            "--rrmin", default=-1, type=float, help="paramter for search")
+        
+        self.add_argument(
+            "--rdelta", default=0.1, type=float, help="paramter for search")
+        
+        self.add_argument(
+            "--nstep", default=20, type=int, help="paramter for search")
  
  
 class EvalArgumentParser(argparse.ArgumentParser):
@@ -483,6 +492,9 @@ def tune(args):
         device_map=args.device_map,
         super_group_size=args.super_group_size,
         super_bits=args.super_bits,
+        rrmin=args.rrmin,
+        rdelta=args.rdelta,
+        nstep=args.nstep,
     )
  
     model_name = args.model.rstrip("/")

@@ -441,7 +441,7 @@ def collect_best_params(block):
     return params
 
 
-def block_forward(block, input_ids, input_others, amp=False, amp_dtype=torch.float16, device=torch.device("cpu")):
+def block_forward(block, input_ids, input_others, amp=False, amp_dtype=torch.float16, device=torch.device("cpu"), cur_iter=-1):
     """Performs a forward pass through a block with the given inputs.
 
     Args:

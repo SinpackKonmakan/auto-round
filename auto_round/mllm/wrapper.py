@@ -120,10 +120,6 @@ class WrapperLinear(torch.nn.Module):
         shape = get_scale_shape(orig_weight, orig_layer.group_size)
         self._init_params("min_scale", p_dtype, shape, 1.0, self.enable_minmax_tuning)
         self._init_params("max_scale", p_dtype, shape, 1.0, self.enable_minmax_tuning)
-        tmp_a = (self.weight_min.view(-1,self.orig_layer.super_group_size))
-        tmp_b = (self.weight_max.view(-1,self.orig_layer.super_group_size))
-        self._init_params("k_wm", p_dtype, get_scale_shape(tmp_a, orig_layer.super_group_size), 1.0, self.enable_minmax_tuning)
-        self._init_params("k_scale", p_dtype, get_scale_shape(tmp_b, orig_layer.super_group_size), 1.0, self.enable_minmax_tuning)
 
         self.weight_quant_func, self.data_type = get_quant_func(orig_layer.data_type, orig_layer.bits,
                                                                 orig_layer.sym)
@@ -159,7 +155,7 @@ class WrapperLinear(torch.nn.Module):
 
         setattr(self, name, p)
 
-    def _qdq_weight(self, value, min_scale, max_scale, cur_iter, k_wm, k_scale):
+    def _qdq_weight(self, value, min_scale, max_scale, cur_iter):
         """Quantizes and dequantizes weights with tuning parameters.
 
         Args:
@@ -174,8 +170,6 @@ class WrapperLinear(torch.nn.Module):
         pre_wmin_m = self.pre_wmin_m
         min_scale.data.clamp_(0, 1.0)
         max_scale.data.clamp_(0, 1.0)
-        # k_wm.data.clamp_(0, 1.0) #consider if is necessary
-        # k_scale.data.clamp_(0, 1.0)
         weight = self.orig_layer.weight
         if weight.device.type == 'meta':
             weight = self.orig_layer.get_weight().to(self.device)
@@ -204,8 +198,6 @@ class WrapperLinear(torch.nn.Module):
             pre_wmin_m=pre_wmin_m,
             rrmin=self.rrmin,
             rdelta=self.rdelta,
-            k_wm=k_wm,
-            k_scale=k_scale,
             nstep=self.nstep,
             **quant_kwargs
         )
@@ -261,13 +253,11 @@ class WrapperLinear(torch.nn.Module):
         v = best_params.get('value', torch.tensor(0.0)).to(self.device)
         min_scale = best_params.get('min_scale', torch.tensor(1.0)).to(self.device)
         max_scale = best_params.get('max_scale', torch.tensor(1.0)).to(self.device)
-        k_wm = best_params.get('k_wm', torch.tensor(1.0)).to(self.device)
-        k_scale = best_params.get('k_scale', torch.tensor(1.0)).to(self.device)
 
         if self.orig_layer.weight.device.type == 'meta':
             self.orig_layer.to(self.device)
         ##unwrapper weight
-        qdq_weight, scale, zp = self._qdq_weight(v, min_scale, max_scale, cur_iter, k_wm, k_scale)
+        qdq_weight, scale, zp = self._qdq_weight(v, min_scale, max_scale, cur_iter)
 
         self.orig_layer.weight.data.copy_(qdq_weight)
         self.orig_layer.weight.grad = None
@@ -375,7 +365,7 @@ class WrapperLinear(torch.nn.Module):
         """
         cur_iter = self.cur_iter
         x = x.to(self.device)
-        weight_q, pre_scale, pre_wmin_m = self._qdq_weight(self.value, self.min_scale, self.max_scale, cur_iter, self.k_wm, self.k_scale)
+        weight_q, pre_scale, pre_wmin_m = self._qdq_weight(self.value, self.min_scale, self.max_scale, cur_iter)
         self.pre_scale = pre_scale["pre_scale"]
         self.pre_wmin_m = pre_wmin_m["pre_wmin_m"]
         if self.enable_act_quant:
