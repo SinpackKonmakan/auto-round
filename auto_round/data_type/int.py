@@ -135,6 +135,73 @@ def quant_tensor_asym_dq(tensor, cur_iter, bits=4, group_size=-1, v=0, min_scale
     # zp = round_ste(wmin_m / scale)  # remove this later
     return qdq_result, {"scale": scale, "d_scale": d_scale, "pre_scale":p_scale}, {"wmin_m": wmin_m, "d_wmin_m": d_wmin_m, "pre_wmin_m":p_wmin_m}
 
+def quant_tensor_k_quant_IRLS(data, num_bits=4, group_size=32):
+    data = data.to(torch.float32)
+    data = data.reshape((-1, group_size))  # shape: (nb, group_size)
+
+    maxq = 2 ** num_bits - 1
+    minq = 0
+    sum_x2 = torch.sum(data ** 2, dim=1, keepdim=True)
+    av_x = torch.sqrt(sum_x2 / group_size)
+    
+    # Initialize weights (IRLS starts with fixed weights, then updates dynamically)
+    weights = av_x + torch.abs(data)  # Initial weights (original logic)
+
+    rmin = torch.min(data, dim=1, keepdim=True)[0]
+    rmax = torch.max(data, dim=1, keepdim=True)[0]
+
+    iscale = torch.ones_like(rmax, dtype=data.dtype)
+    mask = rmin != rmax
+    iscale[mask] = (maxq - minq) / (rmax[mask] - rmin[mask])
+    scale = 1 / iscale
+    quant_data = torch.clamp(torch.round(iscale * (data - rmin)), minq, maxq)
+    diff = scale * quant_data + rmin - data
+    best_mad = torch.sum(weights * diff ** 2, dim=1, keepdim=True)
+
+    nstep = 20
+    rdelta = 0.1
+    rrmin = -1
+    epsilon = 1e-6  # For numerical stability
+
+    for is_ in range(nstep):
+        # --- IRLS modification: Update weights based on current residuals ---
+        current_diff = scale * quant_data + rmin - data
+        weights = 1.0 / (torch.abs(current_diff) + epsilon)  # Dynamic reweighting
+        
+        # Recompute sums with updated weights
+        sum_w = torch.sum(weights, dim=1, keepdim=True)
+        sum_x = torch.sum(weights * data, dim=1, keepdim=True)
+
+        # --- Original optimization logic (adjusted for dynamic weights) ---
+        iscale_new = torch.ones_like(rmax, dtype=data.dtype)
+        factor = rrmin + rdelta * is_ + maxq - minq
+        iscale_new[mask] = factor / (rmax[mask] - rmin[mask])
+
+        quant_data_new = torch.clamp(torch.round(iscale_new * (data - rmin)), minq, maxq)
+        mul_weights_quant_data_new = weights * quant_data_new
+
+        sum_l = torch.sum(mul_weights_quant_data_new, dim=1, keepdim=True)
+        sum_l2 = torch.sum(mul_weights_quant_data_new * quant_data_new, dim=1, keepdim=True)
+        sum_xl = torch.sum(mul_weights_quant_data_new * data, dim=1, keepdim=True)
+
+        D = sum_w * sum_l2 - sum_l ** 2 + epsilon  # Avoid division by zero
+        this_scale = (sum_w * sum_xl - sum_x * sum_l) / D
+        this_min = (sum_l2 * sum_x - sum_l * sum_xl) / D
+
+        # Update parameters if error improves
+        diff = this_scale * quant_data_new + this_min - data
+        mad = torch.sum(weights * diff ** 2, dim=1, keepdim=True)
+        idx_to_replace = torch.where((mad < best_mad) & (D > 0))[0]
+
+        quant_data[idx_to_replace] = quant_data_new[idx_to_replace]
+        best_mad[idx_to_replace] = mad[idx_to_replace]
+        scale[idx_to_replace] = this_scale[idx_to_replace]
+        rmin[idx_to_replace] = this_min[idx_to_replace]
+
+    scale = scale.to(torch.float32)
+    rmin = rmin.to(torch.float32)
+    return scale, -rmin
+
 def quant_tensor_k_quant_torch(data, num_bits=4, group_size=32):
     data = data.to(torch.float32)
     data = data.reshape((-1, group_size))  # nb = data.shape[0], (nb, group_size)
