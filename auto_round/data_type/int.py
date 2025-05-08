@@ -112,7 +112,7 @@ def quant_tensor_asym_dq(tensor, cur_iter, bits=4, group_size=-1, v=0, min_scale
         wmax = wmax_tmp
     
     if cur_iter%20==0 or pre_scale==None:
-        scale,wmin_m = quant_tensor_k_quant_torch(tensor, num_bits=bits, group_size=group_size, rrmin=rrmin, rdelta=rdelta, nstep=nstep)
+        scale,wmin_m = quant_tensor_k_quant_IRLS(tensor, num_bits=bits, group_size=group_size, rrmin=rrmin, rdelta=rdelta, nstep=nstep)
         scale = scale.squeeze(-1)
     else:
         scale = pre_scale
@@ -140,7 +140,7 @@ def quant_tensor_asym_dq(tensor, cur_iter, bits=4, group_size=-1, v=0, min_scale
 def quant_tensor_k_quant_IRLS(data, num_bits=4, group_size=32, rrmin=-1, rdelta=0.1, nstep=20):
     data = data.to(torch.float32)
     data = data.reshape((-1, group_size))  # shape: (nb, group_size)
-    use_mad = True if num_bits == 2 else False
+    # use_mad = True if num_bits == 2 else False
     maxq = 2 ** num_bits - 1
     minq = 0
     sum_x2 = torch.sum(data ** 2, dim=1, keepdim=True)
@@ -190,8 +190,8 @@ def quant_tensor_k_quant_IRLS(data, num_bits=4, group_size=32, rrmin=-1, rdelta=
 
         # Update parameters if error improves
         diff = this_scale * quant_data_new + this_min - data
-        diff = torch.abs(diff) if use_mad else diff**2
-        mad = torch.sum(weights * diff, dim=1, keepdim=True)
+        # diff = torch.abs(diff) if use_mad else diff**2
+        mad = torch.sum(weights * diff **2, dim=1, keepdim=True)
         idx_to_replace = torch.where((mad < best_mad) & (D > 0))[0]
 
         quant_data[idx_to_replace] = quant_data_new[idx_to_replace]
@@ -206,7 +206,7 @@ def quant_tensor_k_quant_IRLS(data, num_bits=4, group_size=32, rrmin=-1, rdelta=
 def quant_tensor_k_quant_torch(data, num_bits=4, group_size=32, rrmin=-1, rdelta=0.1, nstep=20):
     data = data.to(torch.float32)
     data = data.reshape((-1, group_size))  # nb = data.shape[0], (nb, group_size)
-    use_mad = True if num_bits==2 else False
+    # use_mad = True if num_bits==2 else False
     maxq = 2 ** num_bits - 1
     minq = 0
     sum_x2 = torch.sum(data ** 2, dim=1, keepdim=True)  # (nb, 1)
@@ -245,8 +245,8 @@ def quant_tensor_k_quant_torch(data, num_bits=4, group_size=32, rrmin=-1, rdelta
         this_scale = (sum_w * sum_xl - sum_x * sum_l) / D  # (nb, 1)
         this_min = (sum_l2 * sum_x - sum_l * sum_xl) / D  # (nb, 1)
  
-        diff = torch.abs(diff) if use_mad else diff**2
-        mad = torch.sum(weights * diff, dim=1, keepdim=True)
+        # diff = torch.abs(diff) if use_mad else diff**2
+        mad = torch.sum(weights * diff **2, dim=1, keepdim=True)
         # print(f"alpha:{this_scale}")
         # print(f"residual:{factor-this_scale-(maxq - minq)}")
         idx_to_replace = torch.where((mad < best_mad) & (D > 0))[0]
