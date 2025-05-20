@@ -12,12 +12,13 @@ CUDA_VISIBLE_DEVICES=$device python -m auto_round \
         --bits 2 \
         --iters 200 \
         --asym \
-        --rrmin -1 \
+        --rrmin -0.5 \
         --rdelta 0.1 \
-        --nstep 20 \
+        --nstep 15 \
+        --disable_minmax_tuning \
         --model /models/${model_name} \
-        --output_dir /data5/shiqi/model/q2_${format}_${model_name}_search_tune_rrm-1_ns20 \
+        --output_dir /data5/shiqi/model/q2_${format}_${model_name}_search_tune_10time_dis \
         --eval_bs 16 \
         --tasks lambada_openai,arc_challenge,arc_easy,boolq,hellaswag,mmlu,openbookqa,piqa,truthfulqa_mc1,winogrande \
-        2>&1 | tee /data5/shiqi/log/q2_${format}_${model_name}_search_tune_rrm-1_ns20.log
+        2>&1 | tee /data5/shiqi/log/q2_${format}_${model_name}_search_tune_10time_dis.log
 done
