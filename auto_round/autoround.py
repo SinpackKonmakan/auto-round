@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licensefs/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -1344,6 +1344,23 @@ class AutoRound(object):
         dump_info = f"quantized {layer_name},  loss iter 0: {init_loss:.6f} -> iter {best_iter}: {last_loss:.6f}"
         logger.info(dump_info)
 
+    def register_act_weight_quant_hook(self, model):
+        quant_name_lists = ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj', 'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj']
+        def get_act_hook(module, input, output):
+            # if module.name in quant_name_lists:
+            tmp_name = module.name.strip("model.layers")
+            tmp_name = tmp_name.strip("0\.")
+            self.act_lists[tmp_name]=input[0]
+            
+        hook_handles = []
+
+        for n, m in model.named_modules():
+            # breakpoint()
+            if n in quant_name_lists:
+                hook = m.register_forward_hook(get_act_hook)
+                hook_handles.append(hook)
+        return hook_handles
+
     def register_act_max_hook(self, model):
         def get_act_max_hook(module, input, output):
             if isinstance(input, (tuple, list)):
@@ -1383,8 +1400,9 @@ class AutoRound(object):
                 hook = AlignDevicesHook(m.tuning_device, io_same_device=True)
                 add_hook_to_module(m, hook, True)
 
+        self.act_lists = {}
         if q_input is None:
-            hook_handles = self.register_act_max_hook(block)
+            hook_handles = self.register_act_weight_quant_hook(block)
 
             output = self.get_block_outputs(block, input_ids, input_others, self.batch_size * self.infer_bs_coeff,
                                             device,
@@ -1396,7 +1414,8 @@ class AutoRound(object):
             output = self.get_block_outputs(block, input_ids, input_others, self.batch_size * self.infer_bs_coeff,
                                             device,
                                             self.cache_device)
-            hook_handles = self.register_act_max_hook(block)
+            # hook_handles = self.register_act_max_hook(block)
+            hook_handles = self.register_act_weight_quant_hook(block)
             self.get_block_outputs(block, q_input, input_others, self.batch_size * self.infer_bs_coeff,
                                    device, self.cache_device, save_output=False)
 
@@ -1410,9 +1429,19 @@ class AutoRound(object):
                 clear_memory()
             input_ids = q_input
 
+        #save origin weight
+        o_weight = {}
+        o_weight['self_attn.q_proj'] = copy.deepcopy(block.self_attn.q_proj)
+        o_weight['self_attn.k_proj'] = copy.deepcopy(block.self_attn.k_proj)
+        o_weight['self_attn.v_proj'] = copy.deepcopy(block.self_attn.v_proj)
+        o_weight['self_attn.o_proj'] = copy.deepcopy(block.self_attn.o_proj)
+        o_weight['mlp.gate_proj'] = copy.deepcopy(block.mlp.gate_proj)
+        o_weight['mlp.up_proj'] = copy.deepcopy(block.mlp.up_proj)
+        o_weight['mlp.down_proj'] = copy.deepcopy(block.mlp.down_proj)
+        
+
         quantized_layer_names, unquantized_layer_names = wrapper_block(
             block, self.enable_minmax_tuning, self.enable_norm_bias_tuning, device=self.device)
-
         round_params = []
         minmax_params = []
         for n, m in block.named_modules():
@@ -1489,6 +1518,8 @@ class AutoRound(object):
                 output_q = block_forward(
                     block, current_input_ids, current_input_others, self.amp, self.amp_dtype, device
                 )
+
+              
                 if self.amp:
                     with autocast(device_type=device.split(":")[0], dtype=self.amp_dtype):
                         loss = mse_loss(output_q, current_output)  # pylint: disable=not-callable
@@ -1500,6 +1531,25 @@ class AutoRound(object):
                 total_loss += loss.item() / num_elm
                 self.scale_loss_and_backward(scaler, loss)
 
+            #compute imatrix
+            imatrix = 0
+            q_weight = {}
+            q_weight['self_attn.q_proj'] = block.self_attn.q_proj
+            q_weight['self_attn.k_proj'] = block.self_attn.k_proj
+            q_weight['self_attn.v_proj'] = block.self_attn.v_proj
+            q_weight['self_attn.o_proj'] = block.self_attn.o_proj
+            q_weight['mlp.gate_proj'] = block.mlp.gate_proj
+            q_weight['mlp.up_proj'] = block.mlp.up_proj
+            q_weight['mlp.down_proj'] = block.mlp.down_proj     
+            for name in quantized_layer_names:
+                if name in self.act_lists.keys():
+                    r = (o_weight[name].state_dict()["weight"]-q_weight[name].state_dict()["orig_layer.weight"])**2
+                    r = r.permute(1,0)
+                    imatrix += torch.sum(
+                        torch.matmul(self.act_lists[name]**2,r)
+                    )
+            print(imatrix)
+            self.act_lists = {}
             if i == 0:
                 init_loss = total_loss
 
