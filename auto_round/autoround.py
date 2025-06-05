@@ -1344,19 +1344,19 @@ class AutoRound(object):
         dump_info = f"quantized {layer_name},  loss iter 0: {init_loss:.6f} -> iter {best_iter}: {last_loss:.6f}"
         logger.info(dump_info)
 
-    def register_act_weight_quant_hook(self, model):
-        quant_name_lists = ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj', 'self_attn.o_proj', 'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj']
+    def register_act_weight_quant_hook(self, model, r_dict=None):
         def get_act_hook(module, input, output):
             # if module.name in quant_name_lists:
-            tmp_name = module.name.strip("model.layers")
-            tmp_name = tmp_name.strip("0\.")
-            self.act_lists[tmp_name]=input[0]
+            # name = model.get(module, "<unknown>")
+            self.imatrix += torch.sum(
+                        torch.matmul(input[0]**2,r_dict[module2name[module]].permute(1,0))
+                    )
             
         hook_handles = []
-
+        module2name = {}
         for n, m in model.named_modules():
-            # breakpoint()
-            if n in quant_name_lists:
+            if isinstance(m, (torch.nn.Linear, torch.nn.Conv1d)) and r_dict:
+                module2name[m] = n
                 hook = m.register_forward_hook(get_act_hook)
                 hook_handles.append(hook)
         return hook_handles
@@ -1400,7 +1400,7 @@ class AutoRound(object):
                 hook = AlignDevicesHook(m.tuning_device, io_same_device=True)
                 add_hook_to_module(m, hook, True)
 
-        self.act_lists = {}
+        self.imatrix = 0
         if q_input is None:
             hook_handles = self.register_act_weight_quant_hook(block)
 
@@ -1430,18 +1430,22 @@ class AutoRound(object):
             input_ids = q_input
 
         #save origin weight
-        o_weight = {}
-        o_weight['self_attn.q_proj'] = copy.deepcopy(block.self_attn.q_proj)
-        o_weight['self_attn.k_proj'] = copy.deepcopy(block.self_attn.k_proj)
-        o_weight['self_attn.v_proj'] = copy.deepcopy(block.self_attn.v_proj)
-        o_weight['self_attn.o_proj'] = copy.deepcopy(block.self_attn.o_proj)
-        o_weight['mlp.gate_proj'] = copy.deepcopy(block.mlp.gate_proj)
-        o_weight['mlp.up_proj'] = copy.deepcopy(block.mlp.up_proj)
-        o_weight['mlp.down_proj'] = copy.deepcopy(block.mlp.down_proj)
-        
+        weight_diff = {}
+        o_w = {}
+        for name, module in block.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
+                o_module = dict(block.named_modules())[name]
+                o_w[name] = copy.deepcopy(module.weight.data.detach())
 
         quantized_layer_names, unquantized_layer_names = wrapper_block(
             block, self.enable_minmax_tuning, self.enable_norm_bias_tuning, device=self.device)
+        
+        #compute r
+        r = {}
+        for n, m in block.named_modules():
+            if isinstance(m, (torch.nn.Linear, torch.nn.Conv1d)):
+                r[n] = (m.weight.data.detach() - o_w[n.rstrip(".orig_layer")])**2
+               
         round_params = []
         minmax_params = []
         for n, m in block.named_modules():
@@ -1491,6 +1495,8 @@ class AutoRound(object):
         best_params = {}
         total_loss = 0
 
+        hook_handles = self.register_act_weight_quant_hook(block, r)
+
         for i in range(self.iters):
             total_loss = 0
             if self.sampler == "rand":
@@ -1518,7 +1524,6 @@ class AutoRound(object):
                 output_q = block_forward(
                     block, current_input_ids, current_input_others, self.amp, self.amp_dtype, device
                 )
-
               
                 if self.amp:
                     with autocast(device_type=device.split(":")[0], dtype=self.amp_dtype):
@@ -1530,26 +1535,6 @@ class AutoRound(object):
 
                 total_loss += loss.item() / num_elm
                 self.scale_loss_and_backward(scaler, loss)
-
-            #compute imatrix
-            imatrix = 0
-            q_weight = {}
-            q_weight['self_attn.q_proj'] = block.self_attn.q_proj
-            q_weight['self_attn.k_proj'] = block.self_attn.k_proj
-            q_weight['self_attn.v_proj'] = block.self_attn.v_proj
-            q_weight['self_attn.o_proj'] = block.self_attn.o_proj
-            q_weight['mlp.gate_proj'] = block.mlp.gate_proj
-            q_weight['mlp.up_proj'] = block.mlp.up_proj
-            q_weight['mlp.down_proj'] = block.mlp.down_proj     
-            for name in quantized_layer_names:
-                if name in self.act_lists.keys():
-                    r = (o_weight[name].state_dict()["weight"]-q_weight[name].state_dict()["orig_layer.weight"])**2
-                    r = r.permute(1,0)
-                    imatrix += torch.sum(
-                        torch.matmul(self.act_lists[name]**2,r)
-                    )
-            print(imatrix)
-            self.act_lists = {}
             if i == 0:
                 init_loss = total_loss
 
@@ -1577,6 +1562,8 @@ class AutoRound(object):
             f"quantized {len(quantized_layer_names)}/{(len(quantized_layer_names) + len(unquantized_layer_names))} "
             f"layers in the block, loss iter 0: {init_loss:.6f} -> iter {best_iter}: {last_loss:.6f}"
         )
+        logger.info(self.imatrix)
+        self.imatrix = 0
         logger.info(dump_info)
         if len(unquantized_layer_names) != 0:
             logger.info(f"{unquantized_layer_names} have not been quantized")
