@@ -416,7 +416,6 @@ def tune(args):
     lm_head_layer_name = "lm_head"
     for n, _ in model.named_modules():
         lm_head_layer_name = n
-    lm_head_layer_name = list(model.named_modules())[-1][0]
     if args.quant_lm_head:
         config = AutoConfig.from_pretrained(model_name, trust_remote_code=not args.disable_trust_remote_code)
         if config.tie_word_embeddings and hasattr(model, "_tied_weights_keys"):
