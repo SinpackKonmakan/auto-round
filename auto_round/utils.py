@@ -192,7 +192,9 @@ def get_scale_shape(weight, group_size):
     Returns:
       The shape of the scale tensor to be used for quantization.
     """
-    if group_size == -1 or weight.shape[1] < group_size:
+    if group_size == 0:
+        return (1)
+    elif group_size == -1 or weight.shape[1] < group_size:
         shape = weight.shape[0]
     else:
         shape = weight.shape[0] * ((weight.shape[1] + group_size - 1) // group_size)
@@ -1240,7 +1242,7 @@ def _gguf_args_check(args_or_ar, format_str=None):
                     reset_list.append(f"{k}={v}")
                     setattr(args_or_ar, k, v)
             if len(unsupport_list) > 0:
-                logger.warning(
+                logger.info(
                     f"format {format} does not support for {', '.join(unsupport_list)},"
                     f" reset to {', '.join(reset_list)}.")
 # Removed obsolete commented-out block for improved readability and maintainability.
