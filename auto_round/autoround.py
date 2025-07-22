@@ -1260,6 +1260,9 @@ class AutoRound(object):
                      "auto_round" in formats[0] or "gguf" in formats[0]) and self.inplace):
                 self.is_packing_immediate = True
         if self.iters == 0:
+             self.check_needs_auto_gguf_mix_mse(
+            block, self.layer_config, self.formats, input_ids, input_others, output, device, self.cache_device)
+
             return self.quantize_rtn()
 
         if bool(self.quant_block_list):
