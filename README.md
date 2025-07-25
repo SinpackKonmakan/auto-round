@@ -6,9 +6,9 @@ AutoRound
 <h3> Advanced Quantization Algorithm for LLMs</h3>
 
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](https://github.com/intel/auto-round)
-[![version](https://img.shields.io/badge/release-0.5.1-green)](https://github.com/intel/auto-round)
+[![version](https://img.shields.io/badge/release-0.6.0-green)](https://github.com/intel/auto-round)
 [![license](https://img.shields.io/badge/license-Apache%202-9C27B0)](https://github.com/intel/auto-round/blob/main/LICENSE)
-<a href="https://huggingface.co/OPEA">
+<a href="https://huggingface.co/Intel">
 <img alt="Model Checkpoints" src="https://img.shields.io/badge/%F0%9F%A4%97%20HF-Models-F57C00">
 </a>
 ---
@@ -23,7 +23,7 @@ AutoRound also offers a variety of useful features, including mixed-bit tuning a
 support for exporting to formats like GPTQ/AWQ/GGUF, and flexible tuning recipes. The below
 image presents an overview of AutoRound. Check out our paper on [arxiv](https://arxiv.org/pdf/2309.05516) for more
 details and quantized models in several Hugging Face Spaces,
-e.g. [OPEA](https://huggingface.co/OPEA), [Intel](https://huggingface.co/Intel), [Kaitchup](https://huggingface.co/kaitchup)
+e.g. [Intel](https://huggingface.co/Intel), [OPEA](https://huggingface.co/OPEA),  [Kaitchup](https://huggingface.co/kaitchup)
 and [fbaldassarri](https://huggingface.co/fbaldassarri).
 
 <div align="center">
@@ -33,12 +33,18 @@ and [fbaldassarri](https://huggingface.co/fbaldassarri).
 <div align="left">
 
 ## What's New
-* [2025.05] AutoRound provides some recipes for **DeepSeek-R1-0528**, please refer to [DeepSeek-R1-0528-int2-mixed-sym-inc](https://huggingface.co/Intel/DeepSeek-R1-0528-int2-mixed-sym-inc), [DeepSeek-R1-0528-int4-sym-gptq-inc](https://huggingface.co/Intel/DeepSeek-R1-0528-int4-gptq-inc-auto-round) and [DeepSeek-R1-0528-int4-asym-awq-inc](https://huggingface.co/Intel/DeepSeek-R1-0528-int4-awq-inc-auto-round) for more details.
+
+* [2025.07] AutoRound now offers experimental support for **GGUF** format, and recommends using optimized RTN mode (--iters 0) for
+  all bits other than 3 bits. A more advanced algorithm tailored for specific configurations may be available in
+  v0.6.1. Example
+  models: [Intel/Qwen3-235B-A22B-q2ks-mixed-AutoRound-inc-v1](https://huggingface.co/Intel/Qwen3-235B-A22B-q2ks-mixed-AutoRound-inc-v1)
+  and [Intel/DeepSeek-R1-0528-q2ks-mixed-AutoRound-inc-v1](https://huggingface.co/Intel/DeepSeek-R1-0528-q2ks-mixed-AutoRound-inc-v1).
+* [2025.05] AutoRound provides some recipes for **DeepSeek-R1-0528**, please refer
+  to [DeepSeek-R1-0528-int2-mixed-sym-inc](https://huggingface.co/Intel/DeepSeek-R1-0528-int2-mixed-sym-inc), [DeepSeek-R1-0528-int4-sym-gptq-inc](https://huggingface.co/Intel/DeepSeek-R1-0528-int4-gptq-inc-auto-round)
+  and [DeepSeek-R1-0528-int4-asym-awq-inc](https://huggingface.co/Intel/DeepSeek-R1-0528-int4-awq-inc-auto-round) for
+  more details.
 * [2025/05] AutoRound has been integrated into **vLLM**. You can now run models in the AutoRound format directly with
   vLLM versions later than v0.85.post1.
-* [2025/04] AutoRound provides some recipes for **Qwen3** series, please refer
-  to [Qwen3-8B-sym-recipe](https://huggingface.co/Intel/Qwen3-8B-int4-AutoRound-inc) and [Qwen3-14B-sym-recipe](https://huggingface.co/Intel/Qwen3-14B-int4-AutoRound-inc) for
-  more details.
 * [2025/04] AutoRound has been integrated into **Transformers**. You can run models in the AutoRound format directly
   with
   Transformers versions later than 4.51.3.
@@ -169,7 +175,7 @@ autoround = AutoRound(model, tokenizer, bits=bits, group_size=group_size, sym=sy
 
 output_dir = "./tmp_autoround"
 ## format= 'auto_round'(default), 'auto_gptq', 'auto_awq'
-autoround.quantize_and_save(output_dir, format='auto_round') 
+autoround.quantize_and_save(output_dir, format="auto_round")
 ```
 
 <details>
@@ -246,20 +252,18 @@ from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, AutoTok
 
 ## load the model
 model_name = "Qwen/Qwen2-VL-2B-Instruct"
-model = Qwen2VLForConditionalGeneration.from_pretrained(
-    model_name, trust_remote_code=True, torch_dtype="auto")
+model = Qwen2VLForConditionalGeneration.from_pretrained(model_name, trust_remote_code=True, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
 ## quantize the model
 bits, group_size, sym = 4, 128, True
-autoround = AutoRoundMLLM(model, tokenizer, processor,
-                          bits=bits, group_size=group_size, sym=sym)
+autoround = AutoRoundMLLM(model, tokenizer, processor, bits=bits, group_size=group_size, sym=sym)
 autoround.quantize()
 
 # save the quantized model, set format='auto_gptq' or 'auto_awq' to use other formats
 output_dir = "./tmp_autoround"
-autoround.save_quantized(output_dir, format='auto_round', inplace=True)
+autoround.save_quantized(output_dir, format="auto_round", inplace=True)
 ```
 
 </details>
@@ -269,6 +273,9 @@ autoround.save_quantized(output_dir, format='auto_round', inplace=True)
 **AutoRound Format**: This format is well-suited for CPU, HPU devices, 2 bits, as well as mixed-precision
 inference. **[2,3,4,8] bits are supported**.
 
+**GGUF** Format: Experimental feature. This format is well-suited for CPU devices and is widely adopted by the
+community. `q*_k`,`q*_0`,`q*_1` are supported.
+
 **AutoGPTQ Format**: This format is well-suited for symmetric quantization on CUDA devices and is widely adopted by the
 community, **[2,3,4,8] bits are supported**. However, **the
 asymmetric kernel has issues** that can cause considerable accuracy drops, particularly at 2-bit quantization and small
@@ -277,9 +284,11 @@ models. Besides, recently 3 bits may have some accuracy issues in Transformers.
 **AutoAWQ Format**: This format is well-suited for asymmetric 4-bit quantization on CUDA devices and is widely
 adopted within the community, **only 4-bits quantization is supported**.
 
-**llmcompressor Format**: This format is for reusing llmcompressor format,  **only INT8 W8A8 dynamic quantization is supported**.
+**llmcompressor Format**: This format is for reusing llmcompressor format,  **only INT8 W8A8 dynamic quantization is
+supported**.
 
-**GGUF** Format: Experimental feature. This format is well-suited for CPU devices and is widely adopted by the community. 
+
+
 ### Quantization Costs
 
 Testing was conducted on the Nvidia A100 80G using the nightly version of PyTorch 2.6.0.dev20241029+cu124. Please note
@@ -324,8 +333,7 @@ this may cause unexpected exceptions.
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 quantized_model_path = "./tmp_autoround"
-model = AutoModelForCausalLM.from_pretrained(quantized_model_path,
-                                             device_map="auto", torch_dtype="auto")
+model = AutoModelForCausalLM.from_pretrained(quantized_model_path, device_map="auto", torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(quantized_model_path)
 text = "There is a girl who likes adventure,"
 inputs = tokenizer(text, return_tensors="pt").to(model.device)
@@ -340,18 +348,18 @@ Triton, but the final choice depends on factors such as bits, group_size, packin
 backend may not always be the most suitable for certain devices. Please refer
 to the following table for the details and specify the backend you want.
 
-| Name                                 | Devices      | Bits    | Dtypes    | Priority | Packing format  | Requirements                     |
-|--------------------------------------|--------------|---------|-----------|----------|-----------------|----------------------------------|
-| ipex                                 | cpu/xpu      | 4       | BF16/FP16 | 5        | gptq_zp+-1/awq  | intel-extension-for-pytorch      |
+| Name                                 | Devices      | Bits    | Dtypes    | Priority | Packing format  | Requirements                          |
+|--------------------------------------|--------------|---------|-----------|----------|-----------------|---------------------------------------|
+| ipex                                 | cpu/xpu      | 4       | BF16/FP16 | 5        | gptq_zp+-1/awq  | intel-extension-for-pytorch           |
 | itrex                                | cpu          | 2,4,8   | BF16/FP16 | 1        | gptq_zp+-1/awq  | <br/>intel-extension-for-transformers |
-| marlin                               | cuda         | 4,8     | BF16/FP16 | 6        | gptq/gptq_zp+-1 | gptqmodel                        |
-| exllamav2 or<br/>gptqmodel:exllamav2 | cuda         | 4       | BF16/FP16 | 5        | gptq            | gptqmodel                        |
-| exllamav2 or<br/>gptq:exllamav2      | cuda         | 4       | FP16      | 5        | gptq_zp+-1      | auto-gptq                        |
-| gptq:cuda                            | cuda         | 2,3,4,8 | FP16      | 1        | gptq_zp+-1      | auto-gptq                        |
-| triton                               | xpu/cuda     | 2,4,8   | BF16/FP16 | 2        | gptq/gptq_zp+-1 | auto-round                       |
-| awq                                  | cuda         | 4       | FP16      | 5        | awq             | auto-awq                         |
-| hpu                                  | hpu          | 4       | BF16      | 0        | gptq/gptq_zp+-1 | auto-round                       |
-| torch                                | xpu/cpu/cuda | 2,3,4,8 | BF16/FP16 | 0        | gptq/gptq_zp+-1 | auto-round                       |
+| marlin                               | cuda         | 4,8     | BF16/FP16 | 6        | gptq/gptq_zp+-1 | gptqmodel                             |
+| exllamav2 or<br/>gptqmodel:exllamav2 | cuda         | 4       | BF16/FP16 | 5        | gptq            | gptqmodel                             |
+| exllamav2 or<br/>gptq:exllamav2      | cuda         | 4       | FP16      | 5        | gptq_zp+-1      | auto-gptq                             |
+| gptq:cuda                            | cuda         | 2,3,4,8 | FP16      | 1        | gptq_zp+-1      | auto-gptq                             |
+| triton                               | xpu/cuda     | 2,4,8   | BF16/FP16 | 2        | gptq/gptq_zp+-1 | auto-round                            |
+| awq                                  | cuda         | 4       | FP16      | 5        | awq             | auto-awq                              |
+| hpu                                  | hpu          | 4       | BF16      | 0        | gptq/gptq_zp+-1 | auto-round                            |
+| torch                                | xpu/cpu/cuda | 2,3,4,8 | BF16/FP16 | 0        | gptq/gptq_zp+-1 | auto-round                            |
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -359,9 +367,9 @@ from transformers import AutoRoundConfig
 
 quantized_model_path = "./tmp_autoround"
 quantization_config = AutoRoundConfig(backend="auto")
-model = AutoModelForCausalLM.from_pretrained(quantized_model_path, device_map="auto",
-                                             torch_dtype="auto",
-                                             quantization_config=quantization_config)
+model = AutoModelForCausalLM.from_pretrained(
+    quantized_model_path, device_map="auto", torch_dtype="auto", quantization_config=quantization_config
+)
 tokenizer = AutoTokenizer.from_pretrained(quantized_model_path)
 text = "There is a girl who likes adventure,"
 inputs = tokenizer(text, return_tensors="pt").to(model.device)
@@ -379,8 +387,9 @@ from transformers import AutoRoundConfig
 
 model_name = "ybelkada/opt-125m-gptq-4bit"
 quantization_config = AutoRoundConfig()
-model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cpu", torch_dtype="auto",
-                                             quantization_config=quantization_config)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name, device_map="cpu", torch_dtype="auto", quantization_config=quantization_config
+)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 text = "There is a girl who likes adventure,"
 inputs = tokenizer(text, return_tensors="pt").to(model.device)
