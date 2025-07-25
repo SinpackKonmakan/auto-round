@@ -2007,12 +2007,12 @@ class AutoRound(object):
         count=0
         quant_bits = {}
         for n, m in block.named_modules():#[4 4 6 4 4 6 8]
-            if check_to_quantized(m) :
+            if check_to_quantized(m) and hasattr(m, "bits"):
                 layer_names.append(n)
                 count+=1
-                if hasattr(m, "bits"):
-                    bits.append(m.bits)
-                    quant_bits[m.bits]=0
+            # if hasattr(m, "bits"):
+                bits.append(m.bits)
+                quant_bits[m.bits]=0
         ori_bit = min(bits)
         for b in bits:
             if b != ori_bit:
@@ -2048,7 +2048,7 @@ class AutoRound(object):
 
         default_layer_config = low_config
         
-        for k in self.layer_config.keys(): #制作要传出的config初始形态（全低bit）
+        for k in self.layer_config.keys():
             s = re.split('\.',k)
             if len(s) <2:
                 continue
@@ -2076,7 +2076,6 @@ class AutoRound(object):
             
             wrapper_layer = WrapperLinear(module,enable_minmax_tuning=False,enable_round_tuning=False,enable_norm_bias_tuning=False,device=device)
             set_module(block, layer_name, wrapper_layer)
-            
             q_output = self.get_block_outputs(block, current_input_ids, input_others, self.batch_size * self.infer_bs_coeff,
                                     device,
                                     cache_device)

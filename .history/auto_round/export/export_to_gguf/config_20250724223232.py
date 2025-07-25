@@ -162,8 +162,6 @@ GGUF_CONFIG["gguf:q5_0"] = GGUF_INNER_CONFIG["gguf:q5_0"]
 GGUF_CONFIG["gguf:q5_0"]["mostly"]= "gguf:q5_0"
 GGUF_CONFIG["gguf:q5_1"] = GGUF_INNER_CONFIG["gguf:q5_1"]
 GGUF_CONFIG["gguf:q5_1"]["mostly"] = "gguf:q5_1"
-GGUF_CONFIG["gguf:q2_k"] = GGUF_INNER_CONFIG["gguf:q2_k"]
-GGUF_CONFIG["gguf:q2_k"]["mostly"]= "gguf:q2_k"
 GGUF_CONFIG["gguf:q2_k_s"] = GGUF_INNER_CONFIG["gguf:q2_k"]
 GGUF_CONFIG["gguf:q2_k_s"]["mostly"]= "gguf:q2_k"
 GGUF_CONFIG["gguf:q3_k"] = GGUF_INNER_CONFIG["gguf:q3_k"]
@@ -194,8 +192,7 @@ GGUF_CONFIG["gguf:fp16"] = GGUF_INNER_CONFIG["gguf:fp16"]
 GGUF_CONFIG["gguf:fp16"]["mostly"]= "gguf:fp16"
 GGUF_CONFIG["gguf:bf16"] = GGUF_INNER_CONFIG["gguf:fp16"]
 GGUF_CONFIG["gguf:bf16"]["mostly"]= "gguf:bf16"
-# GGUF_CONFIG["gguf:q16_k"] = GGUF_INNER_CONFIG["gguf:fp16"]
-# GGUF_CONFIG["gguf:q16_k"]["mostly"]= "gguf:bf16"
+
 
 
 QK_K = 256

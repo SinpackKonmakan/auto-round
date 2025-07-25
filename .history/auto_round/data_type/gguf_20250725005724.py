@@ -49,10 +49,10 @@ def quant_tensor_sym_dq(
     Returns:
         Quantized and de-quantized tensor, scale, zero-point
     """
-    # tensor = tensor.to("cuda")
+    tensor = tensor.to("cuda")
     tensor, orig_shape, pad_len = reshape_pad_tensor_by_group_size(tensor, group_size)
-    # tensor_min.to(tensor.device)
-    # tensor_max.to(tensor.device)
+    tensor_min.to(tensor.device)
+    tensor_max.to(tensor.device)
     maxq = 2 ** (bits - 1)
     if tensor_min is None or tensor_max is None:
         wmin_tmp = torch.clamp(tensor.min(-1)[0], max=0)
@@ -61,8 +61,6 @@ def quant_tensor_sym_dq(
         wmin_tmp = tensor_min
         wmax_tmp = tensor_max
 
-    # wmin_tmp = wmin_tmp.to(min_scale.device)
-    # wmax_tmp = wmax_tmp.to(min_scale.device)
     wmin_abs = -(wmin_tmp * min_scale)  # pylint: disable=E1130
     wmax_abs = wmax_tmp * max_scale
     max_v = (2 * (wmax_abs < wmin_abs).int() - 1) * torch.max(wmax_abs, wmin_abs)

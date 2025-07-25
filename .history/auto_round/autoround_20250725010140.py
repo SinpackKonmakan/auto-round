@@ -2007,12 +2007,12 @@ class AutoRound(object):
         count=0
         quant_bits = {}
         for n, m in block.named_modules():#[4 4 6 4 4 6 8]
-            if check_to_quantized(m) :
+            if check_to_quantized(m) and hasattr(m, "bits"):
                 layer_names.append(n)
                 count+=1
-                if hasattr(m, "bits"):
-                    bits.append(m.bits)
-                    quant_bits[m.bits]=0
+            # if hasattr(m, "bits"):
+                bits.append(m.bits)
+                quant_bits[m.bits]=0
         ori_bit = min(bits)
         for b in bits:
             if b != ori_bit:
@@ -2323,7 +2323,7 @@ class AutoRound(object):
             for handle in hook_handles:
                 handle.remove()
 
-        self.check_needs_auto_gguf_mix_mse(self.model, self.layer_config, self.formats, input_ids, input_others, output, self.device, self.cache_device)
+        # self.check_needs_auto_gguf_mix_mse(self.model, self.layer_config, self.formats, input_ids, input_others, output, self.device, self.cache_device)
         # return self.quantize_rtn()
 
         if q_input is not None:

@@ -2003,16 +2003,12 @@ class AutoRound(object):
 
         ## simple verification, if the layer_config has any mixed-bits setting, we don't apply auto mix precision
         bits = []  
-        layer_names = []
         count=0
         quant_bits = {}
         for n, m in block.named_modules():#[4 4 6 4 4 6 8]
-            if check_to_quantized(m) :
-                layer_names.append(n)
-                count+=1
-                if hasattr(m, "bits"):
-                    bits.append(m.bits)
-                    quant_bits[m.bits]=0
+            if hasattr(m, "bits"):
+                bits.append(m.bits)
+                quant_bits[m.bits]=0
         ori_bit = min(bits)
         for b in bits:
             if b != ori_bit:
@@ -2021,9 +2017,13 @@ class AutoRound(object):
         if len(bits) <= 1:
             return
         del quant_bits[min(bits)]
+        
+        layer_names = []
  
-        # for n, m in block.named_modules():
-            
+        for n, m in block.named_modules():
+            if check_to_quantized(m):
+                layer_names.append(n)
+                count+=1
         
         # if count > 10:
         #     print("不进行混合")
@@ -2048,7 +2048,7 @@ class AutoRound(object):
 
         default_layer_config = low_config
         
-        for k in self.layer_config.keys(): #制作要传出的config初始形态（全低bit）
+        for k in self.layer_config.keys():
             s = re.split('\.',k)
             if len(s) <2:
                 continue
@@ -2076,7 +2076,6 @@ class AutoRound(object):
             
             wrapper_layer = WrapperLinear(module,enable_minmax_tuning=False,enable_round_tuning=False,enable_norm_bias_tuning=False,device=device)
             set_module(block, layer_name, wrapper_layer)
-            
             q_output = self.get_block_outputs(block, current_input_ids, input_others, self.batch_size * self.infer_bs_coeff,
                                     device,
                                     cache_device)
@@ -2107,7 +2106,7 @@ class AutoRound(object):
         for layer_name in layer_names:
             module = get_module(block, layer_name)
             for key in default_config:  
-                setattr(module,key,default_config[key])
+                setattr(module,key,cur_config[key])
             
             wrapper_layer = WrapperLinear(module,enable_minmax_tuning=False,enable_round_tuning=False,enable_norm_bias_tuning=False,device=device)
             set_module(block, layer_name, wrapper_layer)

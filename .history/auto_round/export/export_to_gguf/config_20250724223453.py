@@ -194,8 +194,7 @@ GGUF_CONFIG["gguf:fp16"] = GGUF_INNER_CONFIG["gguf:fp16"]
 GGUF_CONFIG["gguf:fp16"]["mostly"]= "gguf:fp16"
 GGUF_CONFIG["gguf:bf16"] = GGUF_INNER_CONFIG["gguf:fp16"]
 GGUF_CONFIG["gguf:bf16"]["mostly"]= "gguf:bf16"
-# GGUF_CONFIG["gguf:q16_k"] = GGUF_INNER_CONFIG["gguf:fp16"]
-# GGUF_CONFIG["gguf:q16_k"]["mostly"]= "gguf:bf16"
+
 
 
 QK_K = 256

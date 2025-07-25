@@ -1995,24 +1995,19 @@ class AutoRound(object):
 
         target_gguf_format = None
         for format in formats:
-            if format.startswith("gguf"):
+            if format.startswith("gguf") and 'm' in format:
                 target_gguf_format = format
-
         if target_gguf_format is None:
             return
 
         ## simple verification, if the layer_config has any mixed-bits setting, we don't apply auto mix precision
         bits = []  
-        layer_names = []
         count=0
         quant_bits = {}
         for n, m in block.named_modules():#[4 4 6 4 4 6 8]
-            if check_to_quantized(m) :
-                layer_names.append(n)
-                count+=1
-                if hasattr(m, "bits"):
-                    bits.append(m.bits)
-                    quant_bits[m.bits]=0
+            if hasattr(m, "bits"):
+                bits.append(m.bits)
+                quant_bits[m.bits]=0
         ori_bit = min(bits)
         for b in bits:
             if b != ori_bit:
@@ -2021,13 +2016,16 @@ class AutoRound(object):
         if len(bits) <= 1:
             return
         del quant_bits[min(bits)]
- 
-        # for n, m in block.named_modules():
-            
         
-        # if count > 10:
-        #     print("不进行混合")
-        #     return
+        layer_names = []
+ 
+        for n, m in block.named_modules():
+            if check_to_quantized(m):
+                layer_names.append(n)
+                count+=1
+        
+        if count > 10:
+            return
 
         nsamples = min(32, len(outputs))
         whole_indices = torch.randperm(len(outputs))[:nsamples]
@@ -2048,7 +2046,7 @@ class AutoRound(object):
 
         default_layer_config = low_config
         
-        for k in self.layer_config.keys(): #制作要传出的config初始形态（全低bit）
+        for k in self.layer_config.keys():
             s = re.split('\.',k)
             if len(s) <2:
                 continue
@@ -2057,10 +2055,8 @@ class AutoRound(object):
                 self.layer_config[k] = low_config
 
         if len(bits) == 2:
-            print("量化单bit")
             self.choose_one_bit(block,mix_configs,quant_bits,default_config,default_layer_config,layer_names,current_input_ids,input_others,current_output,mse_loss,device,cache_device)
         else:
-            print("量化多bit")
             self.choose_various_bit(block,mix_configs,quant_bits,default_config,default_layer_config,layer_names,current_input_ids,input_others,current_output,mse_loss,device,cache_device)
 
 
@@ -2076,7 +2072,6 @@ class AutoRound(object):
             
             wrapper_layer = WrapperLinear(module,enable_minmax_tuning=False,enable_round_tuning=False,enable_norm_bias_tuning=False,device=device)
             set_module(block, layer_name, wrapper_layer)
-            
             q_output = self.get_block_outputs(block, current_input_ids, input_others, self.batch_size * self.infer_bs_coeff,
                                     device,
                                     cache_device)
@@ -2089,7 +2084,7 @@ class AutoRound(object):
                                     device,
                                     cache_device)
             set_module(block,layer_name,wrapper_layer.orig_layer)
-            cur_loss=torch.sum((torch.stack((q_output-default_output)/default_config))).to(torch.float32)
+            cur_loss=(torch.stack(q_output-default_output).squeeze(1))
             each_loss[layer_name] = cur_loss #把每一层的loss记录下来
         
         top_n_loss = sorted(each_loss.items(), key=lambda x: x[1], reverse=True)[:num_bit] #reverse:get max
@@ -2102,12 +2097,12 @@ class AutoRound(object):
                     self.layer_config[n] = cur_config
                     continue
     
-    def choose_various_bit(self,block,mix_configs,quant_bits,default_config,default_layer_config,layer_names,current_input_ids,input_others,current_output,mse_loss,device,cache_device):
+    def choose_various_bit(self,block,mix_configs,quant_bits,cur_config,default_config,default_layer_config,layer_names,current_input_ids,input_others,current_output,mse_loss,device,cache_device):
         each_loss = {}
         for layer_name in layer_names:
             module = get_module(block, layer_name)
             for key in default_config:  
-                setattr(module,key,default_config[key])
+                setattr(module,key,cur_config[key])
             
             wrapper_layer = WrapperLinear(module,enable_minmax_tuning=False,enable_round_tuning=False,enable_norm_bias_tuning=False,device=device)
             set_module(block, layer_name, wrapper_layer)
