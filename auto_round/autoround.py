@@ -26,6 +26,7 @@ from tqdm import tqdm
 from transformers import set_seed
 
 from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
+from auto_round.data_type.utils import reshape_pad_tensor_by_group_size
 from auto_round.export.export_to_gguf.config import GGUF_CONFIG, GGUF_INNER_CONFIG, ModelType
 from auto_round.low_cpu_mem.utils import get_layers_before_block
 from auto_round.utils import (
@@ -36,6 +37,7 @@ from auto_round.utils import (
     _gguf_args_check,
     block_forward,
     check_is_cpu,
+    check_need_act_calibration,
     check_seqlen_compatible,
     check_skippable_keywords,
     check_to_quantized,
@@ -241,7 +243,7 @@ class AutoRound(object):
         self.cache_device = torch.device("cpu") if self.low_gpu_mem_usage else self.device
 
         ##activation
-        self.act_group_size = act_group_size if act_group_size is not None else self.group_size
+        self.act_group_size = act_group_size if act_group_size is not None else group_size
         self.act_bits = act_bits if act_bits is not None else self.bits
         self.act_sym = act_sym if act_sym is not None else self.sym
         self.act_dynamic = act_dynamic
@@ -254,8 +256,12 @@ class AutoRound(object):
                 self.act_data_type = "float"
 
         tmp_act_bits = infer_bits_by_data_type(self.act_data_type)
-        if tmp_act_bits < 16:
+        if tmp_act_bits < 16 and tmp_act_bits != self.act_bits:
             self.act_bits = tmp_act_bits
+            logger.warning(
+                f"act_bits set in 'act_data_type' do not"
+                f" match the specified 'act_bits' setting. Resetting 'act_bits' to {tmp_act_bits}."
+            )
 
         self.sampler = sampler
         self.not_use_best_mse = not_use_best_mse
@@ -643,7 +649,11 @@ class AutoRound(object):
                         " change format to auto_round"
                     )
                     format = "auto_round"
-
+            if self.act_group_size != 0 and not self.act_dynamic and format == "auto_round:fp8":
+                logger.warning(
+                    f"Please note that quantize activation with act_group_size={self.act_group_size}"
+                    " may result in failure to export or import normally."
+                )
         if re.search(r"q\d_k", format) and not self.data_type.endswith("_dq"):
             logger.error(
                 f"datatype<{self.data_type}> not support to export {format} format."
@@ -843,7 +853,7 @@ class AutoRound(object):
         def register_act_hook(model):
             """Registers hooks to accumulate activation squared norms into `imatrix`."""
 
-            def get_act_max_hook(module, input, output):
+            def get_imatrix_hook(module, input, output):
                 input = input[0] if isinstance(input, (tuple, list)) else input
                 flattened = input.reshape(-1, input.shape[-1]).to(torch.float32)
                 squared = torch.sum(flattened**2, dim=0).to(torch.float32)
@@ -858,7 +868,7 @@ class AutoRound(object):
             hook_handles = []
             for name, module in model.named_modules():
                 if isinstance(module, self.supported_types) and check_to_quantized(module):
-                    hook = module.register_forward_hook(get_act_max_hook)
+                    hook = module.register_forward_hook(get_imatrix_hook)
                     hook_handles.append(hook)
             return hook_handles
 
@@ -1142,7 +1152,9 @@ class AutoRound(object):
         self.model.to("cpu")
         if has_gguf_k and not self.disable_opt_rtn:
             self.quant_rtn_with_imatrix(all_to_quantized_module_names)
-        elif self.act_bits <= 8 and self.act_dynamic is False:
+        elif self.act_bits <= 8 and check_need_act_calibration(
+            self.act_dynamic, self.act_data_type
+        ):  ##TODO, mixed datatype has bug
             hook_handles = self.register_act_max_hook(self.model)
             try:
                 self.quantize_via_rtn_blockwise(all_to_quantized_module_names)
@@ -2144,15 +2156,21 @@ class AutoRound(object):
         def get_act_max_hook(module, input, output):
             if isinstance(input, (tuple, list)):
                 input = input[0]
+            input, _, _ = reshape_pad_tensor_by_group_size(input, self.act_group_size)
+            act_max = torch.max(torch.abs(input), dim=-1).values
             if not hasattr(module, "act_max"):
-                module.act_max = torch.abs(input).max().item()
+                module.act_max = act_max
             else:
-                module.act_max = max(torch.abs(input).max().item(), module.act_max)
+                module.act_max = torch.max(act_max.to(module.act_max.device), module.act_max)
 
         hook_handles = []
 
         for n, m in model.named_modules():
-            if hasattr(m, "act_dynamic") and not m.act_dynamic and check_to_quantized(m):
+            if (
+                hasattr(m, "act_dynamic")
+                and check_need_act_calibration(m.act_dynamic, m.act_data_type)
+                and check_to_quantized(m)
+            ):
                 hook = m.register_forward_hook(get_act_max_hook)
                 hook_handles.append(hook)
                 continue
@@ -2160,10 +2178,11 @@ class AutoRound(object):
             # for whole model, RTN
             if n in self.layer_config:
                 config = self.layer_config[n]
+                act_dynamic = config.get("act_dynamic", True)
+                act_data_type = config.get("act_data_type", None)
                 if (
                     config["bits"] <= 8
-                    and "act_dynamic" in config
-                    and config["act_dynamic"] is False
+                    and check_need_act_calibration(act_dynamic, act_data_type)
                     and check_to_quantized(config)
                 ):
                     hook = m.register_forward_hook(get_act_max_hook)
