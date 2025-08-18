@@ -2232,22 +2232,53 @@ class AutoRound(object):
         if pbar is None:
             pbar = tqdm(range(0, len(block_names), nblocks))
         
-        #convert all block to default quant block
+        for format in self.formats:
+            if format.startswith("gguf"):
+                target_gguf_format = format
+        if target_gguf_format is None:
+            logger.info("target_gguf_format is None, return")
+            return
+
+        bits = []
+        count = 0
+        layer_names = []
+        overall_size = 0
+        blocks_loss = {}
+        #convert all block to default quant block and record the size
+        
         for i in range(0, len(block_names), nblocks):
-            for format in self.formats:
-                if format.startswith("gguf"):
-                    target_gguf_format = format
-            if target_gguf_format is None:
-                logger.info("target_gguf_format is None, return")
-                return
-
-            cur_m_n = block_names[i]
-            cur_m = get_module(model, cur_m_n)
+            cur_n = block_names[i]
+            cur_m = get_module(model, cur_n)
             cur_m = cur_m.to(device)
-            quantized_layer_names, unquantized_layer_names = wrapper_block(
-            cur_m, self.enable_minmax_tuning, self.enable_norm_bias_tuning, device=self.device
-        )
+            # logger.info(f"之前的：{cur_m}")
+            for n, m in cur_m.named_modules():
+                if isinstance(m, SUPPORTED_LAYER_TYPES) and check_to_quantized(m):
+                    new_m = WrapperLinear(
+                        m,
+                        enable_minmax_tuning=self.enable_minmax_tuning,
+                        enable_norm_bias_tuning=self.enable_norm_bias_tuning,
+                        device=device,      
+                    )
+                    set_module(cur_m, n, new_m)
+            # quantized_layer_names, unquantized_layer_names = wrapper_block(
+            # cur_m, self.enable_minmax_tuning, self.enable_norm_bias_tuning, device=self.device
+            # )
+            # logger.info(f"之后的：{cur_m}")
+            for n, m in cur_m.named_modules():
+                if check_to_quantized(m) and hasattr(m,"orig_layer"):
+                    layer_names.append(m.orig_layer.tmp_name)
+                    count += 1
+                    if hasattr(m.orig_layer, "bits"):
+                        bits.append(m.orig_layer.bits)
 
+            low_bit = min(bits)
+            high_bit = max(bits)
+            for n, m in cur_m.named_modules():
+                if check_to_quantized(m) and isinstance(m,WrapperLinear):
+                    overall_size += (m.orig_layer.bits-low_bit)*sum(p.numel() for p in m.parameters())
+
+        overall_size = int(overall_size/1e6)
+        #start to select
         for i in range(0, len(block_names), nblocks):
             if i != 0:
                 pbar.update(1)
@@ -2264,34 +2295,238 @@ class AutoRound(object):
             if not self.model.device.type == "meta" or self.low_cpu_mem_usage:
                 m = m.to(device)
 
-            quant_block(
-                m,
-                input_ids,
-                input_others,
-                q_input=q_input,
-                device=device,
+            if 1:
+                block_loss = self.get_block_loss(m,
+                    input_ids,
+                    input_others,
+                    q_input=q_input,
+                    device=device,)
+                blocks_loss = {**blocks_loss,**block_loss}
+            else:
+                quant_block(
+                    m,
+                    input_ids,
+                    input_others,
+                    q_input=q_input,
+                    device=device,
+                )
+
+        default_config = GGUF_CONFIG[target_gguf_format]
+        split_list = re.split(":|_", target_gguf_format)
+        cur_config = GGUF_CONFIG[f"gguf:q{high_bit}_{split_list[2]}"]
+        #recover all block into orig 
+        # for i in range(0, len(block_names), nblocks):
+        #     cur_m_n = block_names[i]
+        #     cur_m = get_module(model, cur_m_n)
+        #     cur_m = cur_m.to(device)
+            
+        #     for n, m in cur_m.named_modules():
+        #         if hasattr(m,"orig_layer"):
+        #             set_module(cur_m, n, m.orig_layer)
+            
+            # for n, m in cur_m.named_modules():
+            #     if check_to_quantized(m):
+            #         for key in default_config:
+            #             setattr(cur_m, key, default_config[key])
+
+        #DP
+        from collections import defaultdict
+        import numpy as np
+        # 创建二维 defaultdict，每个元素默认是一个 list
+        
+        # choosed_layer = defaultdict(lambda: defaultdict(list))
+        viewd_layer = 0
+        f = np.zeros((len(blocks_loss),overall_size+1))
+        keys = blocks_loss.keys()
+        weights = []
+        names = []
+        # logger.info(blocks_loss)
+        # logger.info("+++++++++++++++++++++++")
+        #init
+        f_k = next(iter(blocks_loss))
+        v , w = blocks_loss[f_k]
+        w = int(w)
+        if v>0:
+            for V in range(w, overall_size-1):
+                if w>V:
+                    f[0][V] = v
+        
+        for layer_name in keys:
+            if viewd_layer == 0:
+                viewd_layer+=1
+                continue
+            if viewd_layer+1==len(keys):
+                break
+            viewd_layer+=1
+            loss, size = blocks_loss[layer_name]
+            # logger.info(layer_name)
+            # logger.info(blocks_loss[layer_name])
+            # logger.info("---------------------")
+            size = int(size)
+            weights.append(size)
+            names.append(layer_name)
+            for V in tqdm(range(overall_size+1)):
+                if size < V:
+                    if f[viewd_layer-1][V]>(f[viewd_layer-1][V-size]+loss):
+                        f[viewd_layer][V] = f[viewd_layer-1][V]
+                    else:
+                        f[viewd_layer][V] = f[viewd_layer-1][V-size]+loss
+                    
+                else:
+                    f[viewd_layer][V] = f[viewd_layer-1][V]
+
+        # 回溯寻找哪些物品被取了
+        w = overall_size
+        selected = []
+        for i in range(viewd_layer-1, 0, -1):
+            if f[i][w] != f[i - 1][w]:
+                selected.append(names[i])  # 记录物品索引
+                c_w = weights[i]
+                w -= c_w
+
+        # tmp_list.append(max_loss[1])
+
+        # logger.info(f"之前的：{cur_m}")
+        
+        # logger.info(f"之后的：{cur_m}")
+        logger.info(f"得到的value:{f[viewd_layer][overall_size-1]}\n选择的layer:{selected}")
+        # for layer_name in selected:
+        #     module = get_module(model, layer_name)
+           
+        #     for key in cur_config:
+        #         setattr(module, key, cur_config[key])
+        #     self.layer_config[module.tmp_name] = cur_config
+
+
+
+    @torch.inference_mode()
+    def get_block_loss(self, block, input_ids, input_others, q_input=None, device=torch.device("cpu"),mode="max", block_type="wrap"):
+        if self.device_map is not None:
+            from accelerate import dispatch_model
+
+            for n, m in block.named_modules():
+                if len(list(m.children())) != 0 or not hasattr(m, "tuning_device"):
+                    continue
+                from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+                hook = AlignDevicesHook(m.tuning_device, io_same_device=True)
+                add_hook_to_module(m, hook, True)
+
+        if q_input is None:
+            hook_handles = self.register_act_max_hook(block)
+
+            output = self.get_block_outputs(
+                block, input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, self.cache_device
             )
 
-        for i in range(0, len(block_names), nblocks):
-            for format in self.formats:
-                if format.startswith("gguf"):
-                    target_gguf_format = format
-            if target_gguf_format is None:
-                logger.info("target_gguf_format is None, return")
-                return
-            layer_names = []
-            cur_m_n = block_names[i]
-            cur_m = get_module(model, cur_m_n)
-            cur_m = cur_m.to(device)
-            for n,m in cur_m.named_modules():
-                if hasattr(m,"orig_layer"):
-                    set_module(m,n,m.orig_layer)
-                    logger.info(f"n:{n}")
+            for handle in hook_handles:
+                handle.remove()
+        else:
+            output = self.get_block_outputs(
+                block, input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, self.cache_device
+            )
+            hook_handles = self.register_act_max_hook(block)
+            if hook_handles:
+                self.get_block_outputs(
+                    block,
+                    q_input,
+                    input_others,
+                    self.batch_size * self.infer_bs_coeff,
+                    device,
+                    self.cache_device,
+                    save_output=False,
+                )
 
+            for handle in hook_handles:
+                handle.remove()
 
+        mse_reduction = "mean"
+        if self.gradient_accumulate_steps != 1:
+            mse_reduction = "sum"
+        mse_loss = torch.nn.MSELoss(reduction=mse_reduction).to(device)
+        target_gguf_format = None
+        for format in self.formats:
+            if format.startswith("gguf"):
+                target_gguf_format = format
+        if target_gguf_format is None:
+            logger.info("target_gguf_format is None, return")
+            return
 
+        ## simple verification, if the layer_config has any mixed-bits setting, we don't apply auto mix precision
+        bits = []
+        count = 0
+        quant_bits = {}
 
+        layer_names = []
 
+        for n, m in block.named_modules():
+            if check_to_quantized(m) and not n.endswith("orig_layer"):
+                layer_names.append(n)
+                count += 1
+                if block_type == "wrap":
+                    if hasattr(m.orig_layer, "bits"):
+                        bits.append(m.orig_layer.bits)
+                        quant_bits[m.orig_layer.bits] = 0
+
+        ori_bit = min(bits)
+        for b in bits:
+            if b != ori_bit:
+                quant_bits[b] += 1
+
+        # if block_type == "wrap":
+        #     count = count/2
+        #     for k in quant_bits.keys():
+        #         quant_bits[k] /= 2
+
+        bits = set(bits)  # {4,6}
+        if len(bits) <= 1:
+            logger.info(f"len<=1,bits为:{bits}不进行选择")
+            return {}
+        del quant_bits[min(bits)]
+        if count > 10:
+            logger.info(f"count>10,为{count}不进行选择")
+            return {}
+
+        nsamples = min(32, len(output))
+        # nsamples = 128
+        whole_indices = torch.randperm(len(output))[:nsamples]
+        ##we assume the block input and output shape are same
+        current_output = [output[x] for x in whole_indices]
+        current_output = torch.cat(current_output, dim=self.batch_dim)
+        # current_output = to_device(current_output, device)
+        current_input_ids = [input_ids[i] for i in whole_indices]
+        default_config = GGUF_CONFIG[target_gguf_format]
+        split_list = re.split(":|_", target_gguf_format)
+        mix_configs = {}
+
+        for k, _ in quant_bits.items():
+            mix_configs[k] = GGUF_CONFIG[f"gguf:q{k}_{split_list[2]}"]
+
+        d_format = [f"gguf:q{min(bits)}_{split_list[2]}"]
+        low_config = GGUF_CONFIG[f"gguf:q{min(bits)}_{split_list[2]}"]
+
+        default_layer_config = low_config
+
+        block_loss = self.do_forward(block,
+                mix_configs,
+                quant_bits,
+                default_config,
+                default_layer_config,
+                layer_names,
+                current_input_ids,
+                input_others,
+                current_output,
+                mse_loss,
+                device,
+                self.cache_device,
+                mode=mode,
+                block_type=block_type,)
+        return block_loss
+        
+       
+        
+
+        
     @torch.inference_mode()
     def check_needs_auto_gguf_mix_mse(self, block, formats, input_ids, input_others, outputs, device, cache_device, mode="percent", block_type="wrap"):
         ## TODO Q4_K_M does not support iters==0
@@ -2368,21 +2603,6 @@ class AutoRound(object):
         low_config = GGUF_CONFIG[f"gguf:q{min(bits)}_{split_list[2]}"]
 
         default_layer_config = low_config
-        # start_num = 2
-        # end_num = 29
-        # if(start_num<int(s_l[-1])<end_num):
-        #     logger.info(f"不混合{s_l[-1]}层")
-        #     for layer_name in layer_names:
-        #         module = get_module(block, layer_name)
-        #         self.layer_config[module.tmp_name] = default_layer_config
-        #         # logger.info(tmp_ori_layer[module.tmp_name])
-        #         for key in default_layer_config:
-        #             setattr(module, key, default_layer_config[key])
-        #     return
-        # if(int(s_l[-1])>=end_num or int(s_l[-1])<=start_num):
-        #     lim_size = False
-        #     for kx in quant_bits.keys():
-        #         quant_bits[kx]+=1
 
         if len(bits) == 2:
             logger.info(f"量化单bit：{quant_bits},模式为：{mode}")
@@ -2636,7 +2856,7 @@ class AutoRound(object):
                 marginal = income/((cur_config["bits"]-default_config["bits"])*sum(a.numel() for a in module.parameters())) #边际收益越高值为负且越小
                 cur_loss = marginal
             
-            each_loss[layer_name] = (cur_loss, (cur_config["bits"]-module.bits)*sum(p.numel() for p in module.parameters())/1e6)  # 把每一层的loss以及size记录下来
+            each_loss[layer_name] = (cur_loss, (cur_config["bits"]-default_config["bits"])*sum(p.numel() for p in module.parameters())/1e6)  # 把每一层的loss以及size记录下来
 
         #DP
         from collections import defaultdict
@@ -2655,6 +2875,7 @@ class AutoRound(object):
                 f[0][V] = v
                 choosed_layer[0][V].append(layer_name)
 
+        logger.info("开始dp")
         for layer_name in layer_names:
             viewd_layer+=1
             loss, size = each_loss[layer_name]
@@ -2677,7 +2898,6 @@ class AutoRound(object):
         # tmp_list.append(max_loss[1])
         logger.info(f"得到的value:{f[viewd_layer][layer_size-1]}\n选择的layer:{choosed_layer[viewd_layer][layer_size-1]}")
         for layer_name in choosed_layer[viewd_layer][layer_size-1]:
-            
             module = get_module(block, layer_name)
            
             for key in cur_config:
@@ -2686,6 +2906,97 @@ class AutoRound(object):
             self.layer_config[module.tmp_name] = cur_config
             # continue
 
+    
+    def do_forward(#TODO:运行成功后优化代码
+        self,
+        block,
+        mix_configs,
+        quant_bits,
+        default_config,
+        default_layer_config,
+        layer_names,
+        current_input_ids,
+        input_others,
+        current_output,
+        mse_loss,
+        device,
+        cache_device,
+        mode=None,
+        block_type=None,
+    ):
+        each_loss = {}
+        tmp_ori_layer = {}
+        # bit = mix_configs.keys()[0]
+        [(_, cur_config)] = mix_configs.items()
+        for layer_name in layer_names:
+            module = get_module(block, layer_name)
+
+        for layer_name in layer_names:
+            module = get_module(block, layer_name)
+            if block_type == "wrap" and hasattr(module,"orig_layer"):
+                set_module(block,layer_name,module.orig_layer)
+                module = get_module(block, layer_name)
+            # tmp_ori_layer[module.tmp_name] = self.layer_config[module.tmp_name]
+            # if block_type in {"wrap"}:
+            #     for key in cur_config:
+            #         setattr(module.orig_layer, key, cur_config[key])
+                if mode in {"percent"}:
+                    for key in cur_config:
+                        setattr(module, key, cur_config[key])
+            
+            self.layer_config[module.tmp_name] = default_config
+            
+            wrapper_layer = WrapperLinear(
+                module,
+                enable_minmax_tuning=False,
+                enable_round_tuning=False,
+                enable_norm_bias_tuning=False,
+                device=device,
+            )
+            set_module(block, layer_name, wrapper_layer)
+            q_output = self.get_block_outputs(
+                block, current_input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, cache_device
+            )
+
+            if mode in {"percent", "marginal income ratio"}:
+                for key in default_config:
+                    setattr(module, key, default_config[key])
+                wrapper_layer = WrapperLinear(
+                    module,
+                    enable_minmax_tuning=False,
+                    enable_round_tuning=False,
+                    enable_norm_bias_tuning=False,
+                    device=device,
+                    )
+                set_module(block, layer_name, wrapper_layer)
+                q2_output = self.get_block_outputs(
+                block, current_input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, cache_device
+                )
+            
+            module = get_module(block, layer_name)
+            for key in default_config:
+                setattr(module, key, default_config[key])
+            
+            if mode == "max":
+                cur_loss = 1/mse_loss(torch.stack(q_output).squeeze(1), current_output)
+            elif mode == "sensitive":
+                cur_loss = -mse_loss(torch.stack(q_output).squeeze(1), current_output) #敏感度越大，loss掉的越多，所以要选择-loss小的
+            elif mode == "percent":
+                loss_high = mse_loss(torch.stack(q_output).squeeze(1), current_output)
+                loss_low = mse_loss(torch.stack(q2_output).squeeze(1), current_output)
+                cur_loss = -(loss_high - loss_low)/loss_low #改善率越高，值为正且越大
+            elif mode == "marginal income ratio":
+                loss_high = mse_loss(torch.stack(q_output).squeeze(1), current_output)
+                loss_low = mse_loss(torch.stack(q2_output).squeeze(1), current_output)
+                income = (loss_high - loss_low)/loss_low #改善率越高，值为负且越小
+                marginal = income/((cur_config["bits"]-default_config["bits"])*sum(a.numel() for a in module.parameters())) #边际收益越高值为负且越小
+                cur_loss = marginal
+            
+            each_loss[module.orig_layer.tmp_name] = (int(cur_loss*1e5)/1e5, int((cur_config["bits"]-default_config["bits"])*sum(p.numel() for p in module.parameters())/1e6))  # 把每一层的loss以及size记录下来
+
+        return each_loss
+
+    
 
     def choose_various_bit(
         self,
