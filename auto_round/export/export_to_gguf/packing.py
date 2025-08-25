@@ -45,7 +45,7 @@ def ggml_quant(
 
     data = data.to(torch.float32).to(device)
     scale = scale.to(device) if scale is not None else scale
-    zp = zp.to(device) if zp is not None else zp
+    zp = zp.to(device) if zp is not None and isinstance(zp, torch.Tensor) else zp
     wmin = wmin.to(device) if wmin is not None else wmin
     d_scale = d_scale.to(device) if d_scale is not None else d_scale
     d_wmin = d_wmin.to(device) if d_wmin is not None else d_wmin
@@ -62,7 +62,7 @@ def ggml_quant(
         device = "cpu"
         blocks = blocks.to(device)
         scale = scale.to(device) if scale is not None else scale
-        zp = zp.to(device) if zp is not None else zp
+        zp = zp.to(device) if zp is not None and isinstance(zp, torch.Tensor) else zp
         wmin = wmin.to(device) if wmin is not None else wmin
         d_scale = d_scale.to(device) if d_scale is not None else d_scale
         d_wmin = d_wmin.to(device) if d_wmin is not None else d_wmin
@@ -257,7 +257,7 @@ def make_qp_quants(nmax, data, quant_weights):
 
     L = torch.round(iscale * data)
     diffs = data - scale * L
-    best_mse = torch.sum(quant_weights * diffs * diffs)
+    best_mse = torch.sum(quant_weights * diffs * diffs, dim=-1)
 
     for _is in range(-4, 5):
         if _is == 0:
@@ -267,7 +267,7 @@ def make_qp_quants(nmax, data, quant_weights):
 
         tmp_L = torch.round(iscale_is * data).clip(max=nmax)
         diffs = data - scale_is * tmp_L
-        mse = torch.sum(quant_weights * diffs * diffs)
+        mse = torch.sum(quant_weights * diffs * diffs, dim=-1)
 
         replace_idx = mse < best_mse
         best_mse[replace_idx] = mse[replace_idx]

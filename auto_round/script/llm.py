@@ -42,8 +42,6 @@ from auto_round.utils import (
     str2bool,
 )
 
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
 
 class BasicArgumentParser(argparse.ArgumentParser):
 
@@ -52,6 +50,8 @@ class BasicArgumentParser(argparse.ArgumentParser):
         self.add_argument(
             "--model", "--model_name", "--model_name_or_path", default="facebook/opt-125m", help="model name or path"
         )
+
+        self.add_argument("--mllm", action="store_true", help="whether to quant multi-modal model.")
 
         self.add_argument("--eval", action="store_true", help="whether to use eval only mode")
 
@@ -198,6 +198,8 @@ class BasicArgumentParser(argparse.ArgumentParser):
 
         self.add_argument("--enable_torch_compile", action="store_true", help="whether to enable torch compile")
 
+        self.add_argument("--enable_alg_ext", action="store_true", help="whether to enable probably better algorithm")
+
         self.add_argument("--act_data_type", "--act_dtype", default=None, type=str, help="activation data type")
 
         self.add_argument("--disable_act_dynamic", action="store_true", help="activation static quantization")
@@ -226,6 +228,31 @@ class BasicArgumentParser(argparse.ArgumentParser):
             help="whether to disable optimization of the RTN mode(iters=0) (default is False).",
         )
 
+        ## ======================= MLLM =======================
+        self.add_argument(
+            "--quant_nontext_module",
+            action="store_true",
+            help="whether to quantize non-text module, e.g. vision component",
+        )
+
+        self.add_argument(
+            "--extra_data_dir",
+            default=None,
+            type=str,
+            help="dataset dir for storing images/audio/videos. "
+            "Can be a dir path or multiple dir path with format as "
+            "'image=path_to_image,video=path_to_video,audio=path_to_audio'"
+            "By default, it will search in the relative path, "
+            "and if not find, will automatic download.",
+        )
+
+        self.add_argument(
+            "--template",
+            default=None,
+            type=str,
+            help="the template for building training dataset. It can be a custom one.",
+        )
+
 
 class EvalArgumentParser(argparse.ArgumentParser):
 
@@ -234,7 +261,7 @@ class EvalArgumentParser(argparse.ArgumentParser):
         self.add_argument(
             "--model", "--model_name", "--model_name_or_path", default="facebook/opt-125m", help="model name or path"
         )
-        self.add_argument("--mllm", default=False, help="whether to eval multi-modal model.")
+        self.add_argument("--mllm", action="store_true", help="whether to eval multi-modal model.")
         self.add_argument(
             "--device",
             "--devices",
@@ -403,11 +430,6 @@ def tune(args):
 
     import torch
 
-    if not args.disable_deterministic_algorithms:
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        # logger.info("`torch.use_deterministic_algorithms` is enabled by default for reproducibility "
-        #             "and can be disabled using the `--disable_deterministic_algorithms` argument.")
-
     if args.enable_torch_compile:
         logger.info(
             "`torch.compile` is enabled to reduce tuning costs. "
@@ -418,40 +440,61 @@ def tune(args):
     if model_name[-1] == "/":
         model_name = model_name[:-1]
     logger.info(f"start to quantize {model_name}")
-    torch_dtype = "auto"
-    if device_str is not None and "hpu" in device_str:
-        torch_dtype = torch.bfloat16
 
-    from auto_round.utils import llm_load_model
+    from auto_round.utils import llm_load_model, mllm_load_model
 
-    model, tokenizer, low_cpu_mem_usage = llm_load_model(
-        model_name,
-        torch_dtype=torch_dtype,
-        use_auto_mapping=use_auto_mapping,
-        trust_remote_code=not args.disable_trust_remote_code,
-        device=device_str,
-        low_cpu_mem_mode=args.low_cpu_mem_mode,
-        low_cpu_mem_tmp_dir=args.low_cpu_mem_tmp_dir,
-        model_dtype=args.model_dtype,
-    )
+    if args.mllm:
+        model, processor, tokenizer, image_processor = mllm_load_model(
+            model_name,
+            device=device_str,
+            use_auto_mapping=use_auto_mapping,
+            trust_remote_code=not args.disable_trust_remote_code,
+            model_dtype=args.model_dtype,
+        )
+        low_cpu_mem_usage = False
+    else:
+        model, tokenizer, low_cpu_mem_usage = llm_load_model(
+            model_name,
+            use_auto_mapping=use_auto_mapping,
+            trust_remote_code=not args.disable_trust_remote_code,
+            device=device_str,
+            low_cpu_mem_mode=args.low_cpu_mem_mode,
+            low_cpu_mem_tmp_dir=args.low_cpu_mem_tmp_dir,
+            model_dtype=args.model_dtype,
+        )
 
-    from auto_round import AutoRound, AutoRoundAdam
+    from auto_round import AutoRound, AutoRoundAdam, AutoRoundMLLM
 
     if "bloom" in model_name:
         args.low_gpu_mem_usage = False
 
     round = AutoRound
+    mllm_kwargs = {}
     if args.adam:
         round = AutoRoundAdam
+    if args.mllm:
+        round = AutoRoundMLLM
+        mllm_kwargs = {
+            "processor": processor,
+            "image_processor": image_processor,
+            "extra_data_dir": args.extra_data_dir,
+            "quant_nontext_module": args.quant_nontext_module,
+            "template": args.template,
+        }
 
     layer_config = {}
     not_quantize_layer_names = get_fp_layer_names(model, args.fp_layers)
     for name in not_quantize_layer_names:
-        layer_config[name] = {"bits": 16}
+        layer_config[name] = {"bits": 16, "act_bits": 16, "data_type": "float", "act_data_type": "float"}
     if len(not_quantize_layer_names) > 0:
         logger.info(f"{not_quantize_layer_names} will not be quantized.")
         for format in formats:
-            if "auto_round" not in format and "fake" not in format and "awq" not in format:
+            if (
+                "auto_round" not in format
+                and "fake" not in format
+                and "awq" not in format
+                and "llmcompressor" not in format
+            ):
                 ##TODO gptq could support some mixed precision config
                 logger.warning(f"mixed precision exporting does not support {format} currently")
 
@@ -472,7 +515,7 @@ def tune(args):
                     break
 
     if args.quant_lm_head:
-        layer_config[lm_head_layer_name] = {"bits": args.bits}
+        layer_config[lm_head_layer_name] = {"bits": args.bits, "act_bits": args.act_bits}
         for format in formats:
             if "auto_round" not in format and "fake" not in format:
                 auto_round_formats = [s for s in SUPPORTED_FORMATS if s.startswith("auto_round")]
@@ -492,10 +535,10 @@ def tune(args):
     enable_torch_compile = True if "--enable_torch_compile" in sys.argv else False
 
     autoround = round(
-        model,
-        tokenizer,
-        args.bits,
-        args.group_size,
+        model=model,
+        tokenizer=tokenizer,
+        bits=args.bits,
+        group_size=args.group_size,
         sym=not args.asym,
         batch_size=args.batch_size,
         dataset=args.dataset,
@@ -516,7 +559,7 @@ def tune(args):
         enable_minmax_tuning=not args.disable_minmax_tuning,
         act_bits=args.act_bits,
         act_group_size=args.act_group_size,
-        low_cpu_mem_usage=low_cpu_mem_usage,
+        low_cpu_mem_usage=args.low_cpu_mem_mode,
         data_type=args.data_type,
         enable_norm_bias_tuning=args.enable_norm_bias_tuning,
         not_use_best_mse=args.not_use_best_mse,
@@ -528,6 +571,9 @@ def tune(args):
         super_group_size=args.super_group_size,
         super_bits=args.super_bits,
         disable_opt_rtn=args.disable_opt_rtn,
+        disable_deterministic_algorithms=args.disable_deterministic_algorithms,
+        enable_alg_ext=args.enable_alg_ext,
+        **mllm_kwargs,
     )
 
     model_name = args.model.rstrip("/")
@@ -587,7 +633,8 @@ def tune(args):
     import time
 
     eval_model_dtype = get_model_dtype(args.eval_model_dtype, "auto")
-    if args.act_bits <= 8 or infer_bits_by_data_type(args.act_data_type) <= 8 or eval_gguf_model:
+    tmp_act_bits = infer_bits_by_data_type(args.act_data_type)
+    if tmp_act_bits is not None and (args.act_bits <= 8 or tmp_act_bits <= 8 or eval_gguf_model):
         if eval_gguf_model:
             # for file in os.listdir(eval_folder):
             #     gguf_file = file
@@ -675,6 +722,8 @@ def tune(args):
                 args.tasks, eval_folder, args.device, args.disable_trust_remote_code, dtype=eval_model_dtype
             )
             st = time.time()
+            if "llama" in args.model.lower():
+                model_args += ",add_bos_token=True"
             res = simple_evaluate(
                 model="hf", model_args=model_args, tasks=tasks, device=device_str, batch_size=args.eval_bs
             )
@@ -773,14 +822,13 @@ def eval_task_by_task(
     set_cuda_visible_devices(device)
     device_str, parallelism = get_device_and_parallelism(device)
 
-    # load after _eval_int in order to make sure import torch after set CUDA_VISBILE_DEVICES
+    # load after _eval_int in order to make sure import torch after set CUDA_VISIBLE_DEVICES
     import traceback
 
-    from lm_eval import simple_evaluate as lm_simple_evaluate
+    from lm_eval import simple_evaluate as lm_simple_evaluate  # pylint: disable=E0611
     from lm_eval.models.huggingface import HFLM
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from auto_round import AutoRoundConfig  # pylint: disable=E0611
     from auto_round.utils import logger
 
     if batch_size is None:
@@ -827,7 +875,7 @@ def eval_task_by_task(
     if isinstance(tasks, str):
         tasks = tasks.replace(" ", "").split(",")
 
-    from lm_eval.utils import make_table  # pylint: disable=E0401
+    from lm_eval.utils import make_table  # pylint: disable=E0611
 
     res_all = {}
     res_keys = ["results", "versions", "n-shot", "higher_is_better"]
