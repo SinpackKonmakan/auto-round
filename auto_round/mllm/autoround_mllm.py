@@ -18,11 +18,17 @@ from typing import Union
 import torch
 from tqdm import tqdm
 
-from auto_round.special_model_handler import SUPPORT_ONLY_TEXT_MODELS, _handle_special_model
-
-from ..autoround import AutoRound
-from ..low_cpu_mem.utils import get_layers_before_block
-from ..utils import (
+from auto_round.autoround import AutoRound
+from auto_round.low_cpu_mem.utils import get_layers_before_block
+from auto_round.mllm.mllm_dataset import get_mllm_dataloader
+from auto_round.mllm.template import Template, get_template
+from auto_round.special_model_handler import (
+    NOT_SUPPORT_ONLY_TEXT_MODELS,
+    SUPPORT_ONLY_TEXT_MODELS,
+    _handle_special_model,
+)
+from auto_round.utils import (
+    check_to_quantized,
     clear_memory,
     detect_device,
     extract_block_names_to_str,
@@ -33,8 +39,6 @@ from ..utils import (
     to_device,
     to_dtype,
 )
-from .mllm_dataset import get_mllm_dataloader
-from .template import Template, get_template
 
 
 def _only_text_test(model, tokenizer, device, model_type):
@@ -43,11 +47,14 @@ def _only_text_test(model, tokenizer, device, model_type):
     if model_type in SUPPORT_ONLY_TEXT_MODELS:  # save time
         return True
 
+    if model_type in NOT_SUPPORT_ONLY_TEXT_MODELS:
+        return False
+
     new_tokenizer = deepcopy(tokenizer)
     device = detect_device(device)
     text = ["only text", "test"]
     new_tokenizer.padding_side = "left"
-    if new_tokenizer.pad_token is None:
+    if hasattr(new_tokenizer, "pad_token") and new_tokenizer.pad_token is None:
         new_tokenizer.pad_token = new_tokenizer.eos_token
     inputs = new_tokenizer(text, return_tensors="pt", padding=True, truncation=True)
 
@@ -57,14 +64,13 @@ def _only_text_test(model, tokenizer, device, model_type):
         model(**inputs)
         return True
     except RuntimeError as e:
-        if "CUDA out of memory" in str(e):
-            model = model.to("cpu")
-            inputs = inputs.to("cpu")
-            try:
-                model(**inputs)
-            except:
-                return False
-        return False
+        model = model.to("cpu")
+        inputs = inputs.to("cpu")
+        try:
+            model(**inputs)
+        except:
+            return False
+        return True
     except Exception as e:
         return False
 
@@ -122,8 +128,8 @@ class AutoRoundMLLM(AutoRound):
 
     def __init__(
         self,
-        model: torch.nn.Module,
-        tokenizer,
+        model: Union[torch.nn.Module, str],
+        tokenizer=None,
         processor=None,
         image_processor=None,
         bits: int = 4,
@@ -132,7 +138,7 @@ class AutoRoundMLLM(AutoRound):
         layer_config: dict = None,
         batch_size: int = 8,
         amp: bool = True,
-        device: str = None,
+        device: Union[str, torch.device, int] = 0,
         lr_scheduler=None,
         dataset: Union[str, list, tuple, torch.utils.data.DataLoader] = None,
         extra_data_dir: str = None,
@@ -166,6 +172,10 @@ class AutoRoundMLLM(AutoRound):
         model_kwargs: dict = None,
         **kwargs,
     ):
+        if isinstance(model, str):
+            model, processor, tokenizer, image_processor = mllm_load_model(model, device=device)
+
+        quant_nontext_module = self._check_quant_nontext(layer_config, quant_nontext_module)
         all_blocks = get_block_names(model, quant_nontext_module)
         self.quant_block_list = find_matching_blocks(model, all_blocks, to_quant_block_names)
         if to_quant_block_names is None:
@@ -179,39 +189,41 @@ class AutoRoundMLLM(AutoRound):
 
         if model.config.model_type == "llava" and isinstance(model, PreTrainedModel):
             template = "default"
-        self.template = template if template is not None else model.config.model_type
-        if not isinstance(dataset, torch.utils.data.DataLoader):
-            self.template = get_template(
-                self.template,
-                model=model,
-                tokenizer=tokenizer,
-                processor=processor,
-                image_processor=image_processor,
-                use_rtn=iters == 0,
-                quiet=not self.quant_nontext_module,
-            )
-            dataset = self.template.default_dataset if dataset is None else dataset
+        if hasattr(model, "name_or_path") and "Mistral-Small-3.2" in model.name_or_path:
+            template = "mistral3_2"
+        if iters > 0:
+            self.template = template if template is not None else model.config.model_type
+            if not isinstance(dataset, torch.utils.data.DataLoader):
+                self.template = get_template(
+                    self.template,
+                    model=model,
+                    tokenizer=tokenizer,
+                    processor=processor,
+                    image_processor=image_processor,
+                    use_rtn=iters == 0,
+                    quiet=not self.quant_nontext_module,
+                )
+                dataset = self.template.default_dataset if dataset is None else dataset
+        else:
+            self.template = None
 
         model = _handle_special_model(model)
 
         from ..calib_dataset import CALIB_DATASETS
         from .mllm_dataset import MLLM_DATASET
 
-        if isinstance(dataset, str):
-            if quant_nontext_module or (
-                dataset in CALIB_DATASETS.keys()
-                and not _only_text_test(model, tokenizer, device, self.template.model_type)
-            ):
-                if quant_nontext_module:
-                    logger.warning(
-                        "Text only dataset cannot be used for calibrating non-text modules,"
-                        "switching to liuhaotian/llava_conv_58k"
-                    )
-                else:
-                    logger.warning(
-                        f"{model.config.model_type} not support for {dataset},"
-                        " will use liuhaotian/llava_conv_58k with default config as an alternative."
-                    )
+        if iters > 0 and isinstance(dataset, str) and dataset in CALIB_DATASETS.keys():
+            if quant_nontext_module:
+                logger.warning(
+                    "Text only dataset cannot be used for calibrating non-text modules,"
+                    " switching to liuhaotian/llava_conv_58k"
+                )
+                dataset = "liuhaotian/llava_conv_58k"
+            elif not _only_text_test(model, tokenizer, device, self.template.model_type):
+                logger.warning(
+                    f"{model.config.model_type} does not support for {dataset},"
+                    " will use liuhaotian/llava_conv_58k with default config as an alternative."
+                )
                 dataset = "liuhaotian/llava_conv_58k"
 
             if dataset in MLLM_DATASET.keys():
@@ -443,3 +455,14 @@ class AutoRoundMLLM(AutoRound):
             output_dir=output_dir, format=format, inplace=inplace, processor=self.processor, **kwargs
         )
         return compressed_model
+
+    def _check_quant_nontext(self, layer_config, quant_nontext_module):
+        if not layer_config:
+            return quant_nontext_module
+        from auto_round.mllm.utils import VISUAL_KEYS
+
+        for layer_name in layer_config.keys():
+            for vlm_key in VISUAL_KEYS:
+                if vlm_key in layer_name and check_to_quantized(layer_config[layer_name]):
+                    return True
+        return quant_nontext_module

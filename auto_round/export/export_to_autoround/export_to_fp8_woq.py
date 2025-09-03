@@ -22,6 +22,7 @@ import torch
 import transformers
 from tqdm import tqdm
 
+from auto_round.data_type.utils import reshape_pad_tensor_by_group_size, revert_tensor_by_pad
 from auto_round.utils import (
     SUPPORTED_LAYER_TYPES,
     check_start_with_block_name,
@@ -32,23 +33,7 @@ from auto_round.utils import (
     set_module,
 )
 
-
-def check_neq_config(config, data_type, bits, group_size, sym):
-    """
-    Checks if the provided configuration parameters are not equal to the values in the config dictionary.
-
-    Args:
-        config (dict): A dictionary containing the configuration parameters.
-        data_type (str): The expected data type.
-        bits (int): The expected number of bits.
-        group_size (int): The expected group size.
-        sym (bool): The expected symmetry flag.
-
-    Returns:
-        list: A list of strings indicating which configuration parameters do not match.
-    """
-    expected_config = {"data_type": data_type, "bits": bits, "group_size": group_size, "sym": sym}
-    return [key for key, expected_value in expected_config.items() if config.get(key) != expected_value]
+from .utils import check_neq_config
 
 
 class FP8WOQLinear(torch.nn.Module):
@@ -61,7 +46,7 @@ class FP8WOQLinear(torch.nn.Module):
         weight_scale,
         bias=None,
         weight_zp=None,
-        act_scale=None,
+        input_scale=None,
         dtype=torch.bfloat16,
     ):
         super().__init__()
@@ -79,8 +64,8 @@ class FP8WOQLinear(torch.nn.Module):
         if weight_zp:
             self.register_buffer("weight_zp", weight_zp.to(dtype))
 
-        if act_scale is not None:
-            self.register_buffer("act_scale", act_scale.to(dtype))
+        if input_scale is not None:
+            self.register_buffer("input_scale", input_scale.to(dtype))
 
 
 def pack_layer(layer_name, model, data_type, packing_device=None):
@@ -117,18 +102,24 @@ def pack_layer(layer_name, model, data_type, packing_device=None):
         return
 
     device = layer.weight.device
-    scale = layer.scale
+    scale = layer.scale.view(-1)
     zp = layer.zp
     weight = layer.weight
-    act_scale = layer.act_scale if hasattr(layer, "act_scale") else None
+    weight, orig_shape, pad_len = reshape_pad_tensor_by_group_size(weight, layer.group_size)
+    act_scale = layer.act_scale.view(-1) if hasattr(layer, "act_scale") else None
     torch_dtype = torch.float8_e4m3fn
     if "fp8_e5m2" in data_type:
         torch_dtype = torch.float8_e5m2
     info = torch.finfo(torch_dtype)
     if zp is not None:
-        q_weight = weight.to(packing_device) / scale.to(packing_device) + zp.to(packing_device)
+        q_weight = (
+            weight.to(packing_device) / scale.to(packing_device).unsqueeze(-1) + zp.to(packing_device)
+            if isinstance(zp, torch.Tensor)
+            else zp
+        )
     else:
-        q_weight = weight.to(packing_device) / scale.to(packing_device)
+        q_weight = weight.to(packing_device) / scale.to(packing_device).unsqueeze(-1)
+    q_weight = revert_tensor_by_pad(q_weight, orig_shape=orig_shape, pad_len=pad_len)
     q_weight = torch.clamp(q_weight, info.min, info.max)
     q_weight = q_weight.to(torch_dtype)
     if isinstance(layer, torch.nn.Linear):
@@ -148,7 +139,7 @@ def pack_layer(layer_name, model, data_type, packing_device=None):
         weight_scale=scale,
         bias=bias,
         weight_zp=zp,
-        act_scale=act_scale,
+        input_scale=act_scale,
         dtype=model.dtype,
     )
 
@@ -199,6 +190,7 @@ def save_quantized_as_autoround(output_dir, inplace=True, backend="auto_round", 
                 layer_config[layer_name],
                 data_type=quantization_config["data_type"],
                 bits=quantization_config["bits"],
+                act_bits=quantization_config["act_bits"],
                 group_size=quantization_config["group_size"],
                 sym=quantization_config["sym"],
             )

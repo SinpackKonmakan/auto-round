@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import copy
 import os
 import re
 import sys
 import time
+import traceback
 from typing import Any, Union
 
 import accelerate
@@ -29,13 +31,18 @@ from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
 from auto_round.data_type.utils import reshape_pad_tensor_by_group_size
 from auto_round.export.export_to_gguf.config import GGUF_CONFIG, GGUF_INNER_CONFIG, ModelType
 from auto_round.low_cpu_mem.utils import get_layers_before_block
+from auto_round.sign_sgd import SignSGD
+from auto_round.special_model_handler import _handle_moe_model
 from auto_round.utils import (
+    INNER_SUPPORTED_LAYER_TYPES,
     SUPPORTED_DTYPES,
+    SUPPORTED_FORMATS,
     SUPPORTED_LAYER_TYPES,
     TORCH_VERSION_AT_LEAST_2_6,
     CpuInfo,
     _gguf_args_check,
     block_forward,
+    check_and_mark_fp8_model,
     check_is_cpu,
     check_need_act_calibration,
     check_seqlen_compatible,
@@ -45,6 +52,8 @@ from auto_round.utils import (
     collect_best_params,
     compile_func,
     convert_dtype_str2torch,
+    convert_fp8_layer_to_linear,
+    convert_fp8_model_to_16b_model,
     detect_device,
     find_matching_blocks,
     flatten_list,
@@ -54,16 +63,22 @@ from auto_round.utils import (
     get_layer_names_in_block,
     get_lm_head_name,
     get_module,
+    get_quant_keys,
     get_shared_keys,
     htcore,
     infer_bits_by_data_type,
     init_cache,
     is_debug_mode,
+    is_mx_fp,
+    is_nv_fp,
     is_optimum_habana_available,
+    is_standard_fp,
+    is_static_afp8,
     llm_load_model,
     logger,
     mv_module_from_gpu,
     reset_params,
+    set_amax_for_all_moe_layers,
     set_module,
     to_device,
     to_dtype,
@@ -73,134 +88,167 @@ from auto_round.wrapper import WrapperLinear, WrapperMultiblock, unwrapper_block
 import torch.nn.functional as F
 
 class AutoRound(object):
-    """For more information, please refer to Cheng, Wenhua, et al. "Optimize weight rounding via signed gradient descent
-     for the quantization of llms." arXiv preprint arXiv:2309.05516 (2023).
+    """Automatic weight rounding (Signed Gradient Descent) for LLM quantization
 
-    Args:
-        model: The PyTorch model to be quantized.
-        tokenizer: An optional tokenizer for processing input data. If none is provided, a dataloader must be supplied.
-        bits (int): Number of bits for quantization (default is 4).
-        group_size (int): Size of the quantization group (default is 128).
-        sym (bool): Whether symmetric quantization is to be used (default is True).
-        layer_config (dict): Configuration for weight quantization (default is None).
-        layer_config={
-                   'layer1':##layer_name
-                   {
-                       'data_type': 'int',
-                       'bits': 4,
-                       'group_size': 128,
-                       'sym': True
-                       'act_data_type': None,
-                       'act_bits': 16,
-                       'act_group_size': None,
-                       'act_sym': None,
+    Reference:
+        Cheng, Wenhua, et al., "Optimize weight rounding via signed gradient descent for
+        the quantization of LLMs." arXiv:2309.05516 (2023).
 
-                   }
-                   ...
-               }
-        batch_size (int): Batch size for training (default is 8).
-        amp (bool): Whether to use automatic mixed precision (default is True).
-        device: The device to be used for tuning (default is "auto").
-        lr_scheduler: The learning rate scheduler to be used.
-        dataset (str): The default dataset name (default is "NeelNanda/pile-10k").
-        enable_quanted_input (bool): Whether to use the output of the previous quantized block as
-                                the input for the current block (default is True).
-        enable_minmax_tuning (bool): Whether to enable weight min-max tuning (default is True).
-        lr (float): The learning rate (default is None, will be set to 1.0/iters).
-        minmax_lr (float): The learning rate for min-max tuning (default is None, it will be set to lr automatically).
-        low_gpu_mem_usage (bool): Whether to use low GPU memory (default is True).
-        low_cpu_mem_usage (bool): Whether to use low CPU memory (default is False).
-        iters (int): Number of iterations (default is 200).
-        seqlen (int): Data length of the sequence for tuning (default is 2048).
-        nsamples (int): Number of samples (default is 128).
-        sampler (str): The sampling method (default is "rand").
-        seed (int): The random seed (default is 42).
-        nblocks (int): Number of blocks (default is 1).
-        gradient_accumulate_steps (int): Number of gradient accumulation steps (default is 1).
-        not_use_best_mse (bool): Whether to use mean squared error (default is False).
-        dynamic_max_gap (int): The dynamic maximum gap (default is -1).
-        data_type (str): The data type to be used (default is "int").
-        scale_dtype (str): The data type of quantization scale to be used (default is "float16"), different kernels
-                           have different choices.
-        act_bits (int): Number of bits for activation quantization. Default is 16.
-        act_group_size (int): Group size for activation quantization. Default is None.
-        act_sym (bool): Whether to use symmetric activation quantization. Default is None.
-        act_data_type (str): Specifies the data type for activations.
-                             Defaults to None, in which case it inherits the weight data type.
-        act_dynamic (bool): Whether to use dynamic activation quantization. Default is True.
-        to_quant_block_names (str|list): A string or list whose elements are list of
-                            block's layer names to be quantized.
-        enable_norm_bias_tuning (bool): Whether to enable fast norm/layer_bias tuning
-        enable_torch_compile (bool): Whether to enable torch compile to optimize quant_block/layer (default it False).
-        device_map (str|dict): device map for each block
-        disable_opt_rtn (bool): Whether to disable optimization of the RTN mode(iters=0) (default is False).
-    Returns:
-        The quantized model.
+    Attributes:
+        model (torch.nn.Module): The loaded PyTorch model in eval mode.
+        tokenizer: Tokenizer used to prepare input text for calibration/tuning.
+        bits (int): Weight quantization bits.
+        group_size (int): Per-group size for weight quantization.
+        sym (bool): Whether to use symmetric weight quantization.
+        layer_config (dict): Per-layer quantization configuration.
+        nsamples (int): Number of calibration samples.
+        enable_torch_compile (bool): Whether to enable torch.compile for quant blocks/layers.
     """
 
     def __init__(
         self,
-        model: torch.nn.Module,
-        tokenizer,
+        model: Union[torch.nn.Module, str],
+        tokenizer=None,
         bits: int = 4,
         group_size: int = 128,
         sym: bool = True,
         layer_config: dict = None,
         batch_size: int = 8,
         amp: bool = True,
-        device: str = None,
-        lr_scheduler=None,
+        device: Union[str, torch.device, int] = 0,
         dataset: Union[str, list, tuple, torch.utils.data.DataLoader] = "NeelNanda/pile-10k",
-        enable_quanted_input: bool = True,
         enable_minmax_tuning: bool = True,
         lr: float = None,
         minmax_lr: float = None,
         low_gpu_mem_usage: bool = False,
-        low_cpu_mem_usage: bool = False,
         iters: int = 200,
         seqlen: int = 2048,
         nsamples: int = 128,
-        sampler: str = "rand",
         seed: int = 42,
-        nblocks: int = 1,
         gradient_accumulate_steps: int = 1,
-        not_use_best_mse: bool = False,
-        dynamic_max_gap: int = -1,
         data_type: str = "int",
-        scale_dtype: Union[str, torch.dtype] = "fp16",
         act_bits: int = 16,
         act_group_size: int = None,
         act_sym: bool = None,
         act_data_type: str = None,
         act_dynamic: bool = True,
-        to_quant_block_names: Union[str, list] = None,
-        enable_norm_bias_tuning: bool = False,
         enable_torch_compile: bool = False,
         device_map: Union[str, dict] = None,
-        super_bits: int = None,
-        super_group_size: int = None,
         disable_opt_rtn: bool = False,
-        model_kwargs: dict = None,
+        enable_alg_ext: bool = False,
         **kwargs,
     ):
+        """Initialize AutoRound with quantization and tuning configuration.
+
+        Args:
+            model (torch.nn.Module | str): Model object or model name to load.
+            tokenizer: Tokenizer for text processing. Required if `model` is not a string and `iters > 0`.
+            bits (int, optional): Weight quantization bits. Defaults to 4.
+            group_size (int, optional): Weight quantization group size. Defaults to 128.
+            sym (bool, optional): Symmetric weight quantization. Defaults to True.
+            layer_config (dict, optional): Layer-wise quantization config. Defaults to None.
+            batch_size (int, optional): Calibration batch size. Defaults to 8.
+            amp (bool, optional): Use AMP for tuning. Defaults to True.
+            device (str | torch.device | int, optional): Compute device. Defaults to 0.
+            dataset (str | list | tuple | DataLoader, optional): Calibration data. Defaults to "NeelNanda/pile-10k".
+            enable_minmax_tuning (bool, optional): Enable weight min-max tuning. Defaults to True.
+            lr (float, optional): Learning rate; if None, set to 1.0 / iters except when iters==0.
+            minmax_lr (float, optional): Learning rate for min-max tuning; defaults to `lr`.
+            low_gpu_mem_usage (bool, optional): Lower GPU memory mode. Defaults to False.
+            iters (int, optional): Optimization iterations. Defaults to 200.
+            seqlen (int, optional): Calibration sequence length. Defaults to 2048.
+            nsamples (int, optional): Number of calibration samples. Defaults to 128.
+            seed (int, optional): Random seed. Defaults to 42.
+            gradient_accumulate_steps (int, optional): Gradient accumulation steps. Defaults to 1.
+            data_type (str, optional): Weight data type string, e.g., "int". Defaults to "int".
+            act_bits (int, optional): Activation quantization bits. Defaults to 16.
+            act_group_size (int, optional): Activation group size. Defaults to None.
+            act_sym (bool, optional): Symmetric activation quantization. Defaults to None.
+            act_data_type (str, optional): Activation data type; inherits weight dtype if None and act_bits < 16.
+            act_dynamic (bool, optional): Dynamic activation quantization. Defaults to True.
+            enable_torch_compile (bool, optional): Enable torch.compile for quant blocks/layers. Defaults to False.
+            device_map (str | dict, optional): Device placement map. Defaults to None.
+            disable_opt_rtn (bool, optional): Disable RTN-mode optimization (iters=0). Defaults to False.
+            enable_alg_ext (bool, optional): Enable algorithm extension (primarily for INT2). Defaults to False.
+            **kwargs: Backward compatible options:
+                - lr_scheduler, sampler, not_use_best_mse, dynamic_max_gap,
+                  super_group_size, super_bits, scale_dtype ("fp16" etc.),
+                  nblocks, low_cpu_mem_usage, to_quant_block_names,
+                  enable_norm_bias_tuning, enable_quanted_input,
+                  disable_deterministic_algorithms, vlm, static_kv_dtype
+        Raises:
+            ValueError: If invalid device is provided or tokenizer is missing for non-str model with iters > 0.
+            RuntimeError: If model parameters are on meta device.
+        Example:
+            Layer-wise configuration structure:
+
+            >>> layer_config = {
+            ...     "layer1": {
+            ...         "data_type": "int",
+            ...         "bits": 4,
+            ...         "group_size": 128,
+            ...         "sym": True,
+            ...         "act_data_type": None,
+            ...         "act_bits": 16,
+            ...         "act_group_size": None,
+            ...         "act_sym": None,
+            ...     },
+            ...     # ...
+            ... }
+        """
+        # Extra/legacy kwargs for backward compatibility
+        # Major version releases may pack them with extra configuration options
+        lr_scheduler = kwargs.pop("lr_scheduler", None)
+        sampler = kwargs.pop("sampler", "rand")
+        not_use_best_mse = kwargs.pop("not_use_best_mse", False)
+        dynamic_max_gap = kwargs.pop("dynamic_max_gap", -1)
+        super_group_size = kwargs.pop("super_group_size", None)
+        super_bits = kwargs.pop("super_bits", None)
+        scale_dtype = kwargs.pop("scale_dtype", "fp16")
+        nblocks = kwargs.pop("nblocks", 1)
+        low_cpu_mem_usage = kwargs.pop("low_cpu_mem_usage", False)
+        to_quant_block_names: Union[str, list, None] = kwargs.pop("to_quant_block_names", None)
+        enable_norm_bias_tuning: bool = kwargs.pop("enable_norm_bias_tuning", False)
+        enable_quanted_input: bool = kwargs.pop("enable_quanted_input", True)
+        disable_deterministic_algorithms = kwargs.pop("disable_deterministic_algorithms", False)
+        static_kv_dtype = kwargs.pop("static_kv_dtype", None)
         self.vlm = kwargs.pop("vlm") if "vlm" in kwargs else False
+
         if kwargs:
-            logger.warning(f"unrecognized keys {list(kwargs.keys())} were passed. Please check them.")
+            logger.warning(f"Unrecognized keys {list(kwargs.keys())} were passed. Please check them.")
+
+        if device is not None and "," in str(device):
+            raise ValueError(
+                "API does not support explicit set multiple devices,"
+                " please set CUDA_VISIBLE_DEVICES yourself and use `device=auto` instead"
+            )
+
+        if not disable_deterministic_algorithms:
+            if "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+                os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+            torch.use_deterministic_algorithms(True, warn_only=False)
+
+        # Model related
         self.quantized = False
-        self.model_orig_dtype = model.dtype
-        self.seed = seed
-        set_seed(self.seed)
+        if isinstance(model, str):
+            model, tokenizer, low_cpu_mem_usage = llm_load_model(
+                model, device=device, low_cpu_mem_mode=low_cpu_mem_usage
+            )
+        elif tokenizer is None and iters > 0:
+            raise ValueError("A tokenizer must be set for non-str model input")
+        self.low_cpu_mem_usage = bool(low_cpu_mem_usage)
         if unsupport_meta_device(model):
             raise RuntimeError(
                 "AutoRound does not support parameters on meta device. "
-                "Please use more GPUs by setting `--device 0,1,2,3` or just use one GPU."
+                "Please use more GPUs by setting `--device 0,1,2,3` or just place the model on CPU."
             )
+        check_and_mark_fp8_model(model)
+        model = _handle_moe_model(model)
+        self.model = model.eval()
+        self.tokenizer = tokenizer
+        self.shared_cache_keys = get_shared_keys(self.model)
 
-        ## important tuning hype-parameters
-        self.amp = amp
-        self.enable_quanted_input = enable_quanted_input
-        self.enable_minmax_tuning = enable_minmax_tuning
-        self.nsamples = nsamples
+        # Set quantization configs
         self.bits = bits
         self.enable_norm_bias_tuning = enable_norm_bias_tuning
         self.group_size = group_size
@@ -226,24 +274,15 @@ class AutoRound(object):
 
         self.data_type = data_type
         tmp_bits = infer_bits_by_data_type(self.data_type)
-        if tmp_bits < 16 and tmp_bits != bits:
-            logger.warning(
-                f"bits set in 'data_type' do not match the specified 'bits' setting. Resetting 'bits' to {tmp_bits}."
-            )
+        if tmp_bits is not None and tmp_bits < 16 and tmp_bits != bits:
+            logger.warning(f"'data_type' do not match the specified 'bits' setting. Resetting 'bits' to {tmp_bits}.")
             self.bits = tmp_bits
-        self.supported_types = SUPPORTED_LAYER_TYPES
-        self.model = model.eval()
-        self.tokenizer = tokenizer
-        self.device = detect_device(device)
-        self.scale_dtype = convert_dtype_str2torch(scale_dtype)
-        self.set_amp_dtype()
+        self.group_size = group_size
+        self.sym = sym
+        self.layer_config = {} if layer_config is None else layer_config
         self.to_quant_block_names = to_quant_block_names
-        if not hasattr(self, "quant_block_list"):
-            all_blocks = get_block_names(model)
-            self.quant_block_list = find_matching_blocks(model, all_blocks, self.to_quant_block_names)
-        self.cache_device = torch.device("cpu") if self.low_gpu_mem_usage else self.device
 
-        ##activation
+        # Activation
         self.act_group_size = act_group_size if act_group_size is not None else group_size
         self.act_bits = act_bits if act_bits is not None else self.bits
         self.act_sym = act_sym if act_sym is not None else self.sym
@@ -252,40 +291,140 @@ class AutoRound(object):
         if self.act_data_type is None:
             if data_type in SUPPORTED_DTYPES and self.act_bits < 16:
                 self.act_data_type = data_type
-                logger.info(f"activation adopts {data_type}")
+                logger.info(f"Activation adopts {data_type}")
             else:
                 self.act_data_type = "float"
-
         tmp_act_bits = infer_bits_by_data_type(self.act_data_type)
-        if tmp_act_bits < 16 and tmp_act_bits != self.act_bits:
+        if tmp_act_bits is not None and tmp_act_bits < 16 and tmp_act_bits != self.act_bits:
             self.act_bits = tmp_act_bits
             logger.warning(
-                f"act_bits set in 'act_data_type' do not"
+                f"`act_data_type` do not"
                 f" match the specified 'act_bits' setting. Resetting 'act_bits' to {tmp_act_bits}."
             )
 
+        # Tuning hyperparameters
+        self.seed = seed
+        set_seed(self.seed)
+        self.amp = amp
+        self.enable_quanted_input = enable_quanted_input
+        self.enable_minmax_tuning = enable_minmax_tuning
+        self.nsamples = nsamples
+        self.enable_norm_bias_tuning = enable_norm_bias_tuning
+        self.low_gpu_mem_usage = low_gpu_mem_usage
+        self.seqlen = seqlen
+        self.batch_size, self.gradient_accumulate_steps = batch_size, gradient_accumulate_steps
+        self.nblocks = nblocks
+        self.dataset = dataset
+        self.iters = iters
+        if self.iters < 0:
+            logger.warning("`iters` must be non-negative, reset it to 200")
+            self.iters = 200
+        if self.iters == 0:
+            self.lr = 5e-3
+        else:
+            self.lr = lr or (1.0 / self.iters)  # must place after iter setting
+        self.minmax_lr = minmax_lr or self.lr
+        self.enable_alg_ext = enable_alg_ext
         self.sampler = sampler
         self.not_use_best_mse = not_use_best_mse
         self.dynamic_max_gap = dynamic_max_gap
         self.lr_scheduler = lr_scheduler
         self.optimizer = self.get_optimizer(None)
-        self.batch_dim = None
-        self.infer_bs_coeff = 1
-
         self.super_bits = super_bits
         self.super_group_size = super_group_size
-
         self.disable_opt_rtn = disable_opt_rtn
+        self.is_packing_immediate = False  # whether to pack the layer immediately after tuning
 
-        torch.set_printoptions(precision=3, sci_mode=True)
-        self.check_configs()
+        # KV cache, this one does not affect tuning but will collect some infos during tuning
+        self.static_kv_dtype = static_kv_dtype
+        if self.static_kv_dtype is not None:
+            logger.warning("The static kv is experimental and currently has limited support.")
+
+        # Model related
+        self.quantized = False
+        if isinstance(model, str):
+            model, tokenizer, low_cpu_mem_usage = llm_load_model(
+                model, device=device, low_cpu_mem_mode=low_cpu_mem_usage
+            )
+        elif tokenizer is None and iters > 0:
+            raise ValueError("A tokenizer must be set for non-str model input")
+        self.low_cpu_mem_usage = bool(low_cpu_mem_usage)
+        if unsupport_meta_device(model):
+            raise RuntimeError(
+                "AutoRound does not support parameters on meta device. "
+                "Please use more GPUs by setting `--device 0,1,2,3` or just place the model on CPU."
+            )
+        model = _handle_moe_model(model)
+        self.model = model.eval()
+        self.tokenizer = tokenizer
+        self.shared_cache_keys = get_shared_keys(self.model)
+        if not hasattr(self, "quant_block_list"):
+            all_blocks = get_block_names(model)
+            self.quant_block_list = find_matching_blocks(model, all_blocks, self.to_quant_block_names)
+
+        # Set device, must place after model loading
+        self.device = detect_device(device)  # must place after llm_load_model, because this one will convert auto
+        self.device_map = device_map
+        self._set_device_map_in_blocks(self.device_map)
+        self.scale_dtype = convert_dtype_str2torch(scale_dtype)
+        self.set_amp_dtype()
+        self.cache_device = torch.device("cpu") if self.low_gpu_mem_usage else self.device
         if self.act_bits <= 8 and self.amp_dtype == torch.float16:
-            logger.warning("force to use bf16 to for quantization tuning when enabling activation quantization")
+            logger.warning("Force to use bf16 to for quantization tuning when enabling activation quantization")
             self.amp_dtype = torch.bfloat16
             self.model = self.model.to(torch.bfloat16)
         else:
             logger.info(f"using {self.model.dtype} for quantization tuning")
 
+        # Some helpers
+        self.supported_types = SUPPORTED_LAYER_TYPES
+        self.inner_supported_types = INNER_SUPPORTED_LAYER_TYPES
+        if "hpu" in str(self.device):
+            self.inner_supported_types = tuple(x for x in INNER_SUPPORTED_LAYER_TYPES if x != "FP8Linear")
+        self.batch_dim = None
+        self.infer_bs_coeff = 1
+        self.enable_torch_compile = enable_torch_compile
+        self._adjust_torch_compile(enable_torch_compile)
+
+        self._check_configs()
+
+        torch.set_printoptions(precision=3, sci_mode=True)
+
+        if is_optimum_habana_available():
+            logger.info("Optimum Habana is available, import htcore explicitly.")
+            import habana_frameworks.torch.core as htcore  # pylint: disable=E0401
+            import habana_frameworks.torch.hpu as hthpu  # pylint: disable=E0401]
+
+        self.serialization_keys = [
+            "bits",
+            "group_size",
+            "sym",
+            "data_type",
+            "enable_quanted_input",
+            "enable_minmax_tuning",
+            "seqlen",
+            "batch_size",
+            "scale_dtype",
+            "lr",
+            "minmax_lr",
+            "gradient_accumulate_steps",
+            "iters",
+            "amp",
+            "nsamples",
+            "low_gpu_mem_usage",
+            "to_quant_block_names",
+            "enable_norm_bias_tuning",
+            "act_bits",
+            "act_group_size",
+            "act_sym",
+            "act_dynamic",
+            "act_data_type",
+            "super_bits",
+            "super_group_size",
+        ]
+
+    def _adjust_torch_compile(self, enable_torch_compile: bool) -> None:
+        """Sets the torch compile configuration for the tuning."""
         self.enable_torch_compile = enable_torch_compile
         if (
             not self.enable_torch_compile
@@ -317,51 +456,11 @@ class AutoRound(object):
             self.enable_torch_compile = False
             logger.warning("reset enable_torch_compile to `False` as fp8 is enabled")
 
-        if is_optimum_habana_available():
-            logger.info("Optimum Habana is available, import htcore explicitly.")
-            import habana_frameworks.torch.core as htcore  # pylint: disable=E0401
-            import habana_frameworks.torch.hpu as hthpu  # pylint: disable=E0401]
-        self.device_map = device_map
-
-        self.set_device_map_in_blocks(self.device_map)
-
-        self.is_packing_immediate = False  ## whether to pack the layer immediately after tuning
-
-        self.serialization_keys = [
-            "bits",
-            "group_size",
-            "sym",
-            "data_type",
-            "enable_quanted_input",
-            "enable_minmax_tuning",
-            "seqlen",
-            "batch_size",
-            "scale_dtype",
-            "lr",
-            "minmax_lr",
-            "gradient_accumulate_steps",
-            "iters",
-            "amp",
-            "nsamples",
-            "low_gpu_mem_usage",
-            "to_quant_block_names",
-            "enable_norm_bias_tuning",
-            "act_bits",
-            "act_group_size",
-            "act_sym",
-            "act_dynamic",
-            "act_data_type",
-            "super_bits",
-            "super_group_size",
-        ]
-
-        self.shared_cache_keys = get_shared_keys(self.model)
-
-    def set_device_map_in_blocks(self, device_map):
+    def _set_device_map_in_blocks(self, device_map: Union[str, dict, None]) -> None:
         """Sets the device map for specific blocks in the model.
 
         Args:
-            device_map (Union[str, dict]): A mapping of module names to devices.
+            device_map (Union[str, dict, None]): A mapping of module names to devices.
                 If provided as a string, it should be in the format
                 "module_name:device,module_name:device". Devices can be integers
                 (GPU IDs) or strings (e.g., 'cpu', 'cuda:0').
@@ -400,7 +499,8 @@ class AutoRound(object):
                         if key in name:
                             self._set_device_for_matching_module(name, device)
 
-    def _set_device_for_matching_module(self, name, device):
+    def _set_device_for_matching_module(self, name: str, device: str) -> None:
+        """Sets the device for a module if it matches the given name."""
         module = get_module(self.model, name)
         if hasattr(module, "tuning_device") and module.tuning_device != device:
             logger.warning(
@@ -409,7 +509,7 @@ class AutoRound(object):
         else:
             module.tuning_device = device
 
-    def _dq_check(self):
+    def _dq_check(self) -> None:
         """Reset the default value of super_bits and super_group_size"""
         if self.data_type.endswith("_dq"):
             gguf_config = GGUF_INNER_CONFIG[f"gguf:q{self.bits}_k"]
@@ -418,62 +518,56 @@ class AutoRound(object):
                 gguf_config["super_group_size"] if self.super_group_size is None else self.super_group_size
             )
 
-    def check_configs(self):
+    def _check_configs(self) -> None:
         """Checks if the configurations are valid.
 
         Raises:
         ValueError, TypeError: If any of the configurations are invalid.
         """
         if not isinstance(self.model, torch.nn.Module):
-            raise TypeError("model must be an instance of torch.nn.Module")
+            raise TypeError("Model must be an instance of torch.nn.Module")
         if self.bits <= 0:
-            raise ValueError("bits must be positive")
+            raise ValueError("`bits` must be positive")
         if self.act_bits <= 0:
-            raise ValueError("act_bits must be positive")
+            raise ValueError("`act_bits` must be positive")
         if not (self.group_size == -1 or self.group_size >= 0):
-            raise ValueError("group_size must be -1 (per channel) or 0 (per-tensor) or a postivie integer")
+            raise ValueError("`group_size` must be -1 (per channel) or 0 (per-tensor) or a positive integer")
         if not (self.act_group_size == -1 or self.act_group_size >= 0):
-            raise ValueError("act_group_size must be -1 (per channel) or 0 (per-tensor) or a positive integer")
+            raise ValueError("`act_group_size` must be -1 (per channel) or 0 (per-tensor) or a positive integer")
         if self.batch_size <= 0:
-            raise ValueError("batch_size must be positive")
+            raise ValueError("`batch_size` must be positive")
         if self.iters < 0:
-            raise ValueError("iters must be non-negative")
+            raise ValueError("`iters` must be non-negative")
         if self.seqlen <= 0:
-            raise ValueError("seqlen must be positive")
+            raise ValueError("`seqlen` must be positive")
         if self.nblocks <= 0:
-            raise ValueError("nblocks must be positive")
+            raise ValueError("`nblocks` must be positive")
         if self.gradient_accumulate_steps <= 0:
-            raise ValueError("gradient_accumulate_steps must be positive")
-        # assert self.tokenizer != None or self.dataloader != None
+            raise ValueError("`gradient_accumulate_steps` must be positive")
+
         if self.act_bits <= 8:
             logger.warning(
-                "activation quantization is an experimental feature with limited support and a complex API. "
+                "Activation quantization is an experimental feature with limited support and a complex API. "
                 "And please save the quantized model to fake format as real deployment is not supported currently"
             )
 
-        if "mx_fp" in self.data_type or "nv_fp" in self.data_type:
-            logger.warning(
-                "please save the quantized model to fake format "
-                "as real deployment is not supported for mx_fp/nv_fp datatype currently"
-            )
+        if is_mx_fp(self.data_type) and self.group_size != 32:
+            logger.warning("Dtype mx_fp should only support group_size of 32 in real deployment")
 
-        if "mx_fp" in self.data_type and self.group_size != 32:
-            logger.warning("mx_fp should only support group_size of 32 in real deployment")
-
-        if "nv_fp" in self.data_type and (self.group_size != 16):
-            logger.warning("nv_fp should only support group_size of 16 in real deployment")
+        if is_nv_fp(self.data_type) and (self.group_size != 16):
+            logger.warning("Dtype nv_fp should only support group_size of 16 in real deployment")
 
         if self.nsamples < self.gradient_accumulate_steps * self.batch_size:
             if self.batch_size > self.nsamples:
                 logger.warning(
-                    f"reset batch_size to {self.nsamples} as nsamples({self.nsamples})"
+                    f"Reset `batch_size` to {self.nsamples} as `nsamples`({self.nsamples})"
                     f" is smaller than batch_size({self.batch_size})"
                 )
                 self.batch_size = self.nsamples
             if self.gradient_accumulate_steps > self.nsamples // self.batch_size:
                 self.gradient_accumulate_steps = self.nsamples // self.batch_size
                 logger.warning(
-                    f"reset gradient_accumulate_steps to {self.gradient_accumulate_steps}"
+                    f"Reset `gradient_accumulate_steps` to {self.gradient_accumulate_steps}"
                     f" as nsamples must equal or greater"
                     f" than gradient_accumulate_steps * batch_size"
                 )
@@ -483,8 +577,9 @@ class AutoRound(object):
 
         self._dq_check()
 
-    def _check_compatibility(self):
-        ##check gguf and others
+    def _check_compatibility(self) -> None:
+        """Checks compatibility of the configurations and model."""
+        # Check gguf and others
         has_gguf = False
         if hasattr(self, "formats"):
             has_besides_gguf = False
@@ -494,7 +589,7 @@ class AutoRound(object):
                 elif format_ != "fake":
                     has_besides_gguf = True
             if has_gguf and has_besides_gguf:
-                raise ValueError("gguf format is not compatible with other formats, please choose only one of them")
+                raise ValueError("Gguf format is not compatible with other formats, please choose only one of them")
             if has_gguf and self.iters != 0 and self.bits != 3:
                 logger.warning(
                     "`iters=0` is recommended when exporting to GGUF format except for bits 3,"
@@ -502,7 +597,7 @@ class AutoRound(object):
                     " We are likely to release new algorithm for certain configurations in the future."
                 )
 
-        ##check group_size 32 for auto_round
+        # Check group_size 32 for auto_round
         if (
             self.data_type == "int"
             and hasattr(self, "formats")
@@ -524,7 +619,7 @@ class AutoRound(object):
         ):
             if self.model.config.max_position_embeddings < self.seqlen:
                 logger.warning(
-                    f"change sequence length to {self.model.config.max_position_embeddings} "
+                    f"Change sequence length to {self.model.config.max_position_embeddings} "
                     "due to the limitation of max_position_embeddings"
                 )
                 self.seqlen = min(self.seqlen, self.model.config.max_position_embeddings)
@@ -532,16 +627,16 @@ class AutoRound(object):
         if self.seqlen is not None and hasattr(self.tokenizer, "model_max_length"):
             if self.tokenizer.model_max_length < self.seqlen:
                 logger.warning(
-                    f"change sequence length to {self.tokenizer.model_max_length} "
+                    f"Change sequence length to {self.tokenizer.model_max_length} "
                     "due to the limitation of model_max_length. "
                     "You can also try to increase the model_max_length to avoid this issue."
                 )
                 self.seqlen = min(self.seqlen, self.tokenizer.model_max_length)
 
         if self.group_size == 0 and "fp8" not in self.data_type:
-            logger.warning("group_size of 0 is not supported for data_type other than fp8 ")
+            logger.warning("`group_size==0` is not supported for data_type other than fp8 ")
 
-    def parse_format_to_list(self, format: str) -> list:
+    def _parse_format_to_list(self, format: str) -> list:
         """Parses the format string into a list of formats.
 
         This method checks the requested format(s) against the model's
@@ -560,7 +655,6 @@ class AutoRound(object):
             _gguf_args_check(self, format, model_type=ModelType.MMPROJ)
 
         formats = format.replace("q*_", f"q{self.bits}_").replace(" ", "").split(",")
-        from auto_round.utils import SUPPORTED_FORMATS
 
         for format_ in formats:
             if format_ not in SUPPORTED_FORMATS:
@@ -591,9 +685,20 @@ class AutoRound(object):
                     )
                     if enable_awq:
                         formats[index] = format.replace("auto_round", "auto_round:auto_awq")
-                if "fp8" in self.data_type:
+                if is_nv_fp(self.data_type) or is_mx_fp(self.data_type) or is_standard_fp(self.data_type):
                     format = format.replace("auto_round", f"auto_round:{self.data_type}")
                     formats[index] = format
+            elif format == "llmcompressor":
+                from auto_round.export.export_to_llmcompressor import check_compressed_tensors_supported
+
+                if check_compressed_tensors_supported() and (is_nv_fp(self.data_type) or is_mx_fp(self.data_type)):
+                    format = format.replace("llmcompressor", f"llmcompressor:{self.data_type}")
+                    formats[index] = format
+                elif not is_standard_fp(self.data_type):
+                    logger.error(
+                        "Currently, the llmcompressor format only supports MXFP/NVFP/StandardFP8. "
+                        "Please change format to fake or auto_round etc."
+                    )
 
         # Remove duplicates from formats list
         def remove_duplicates(lst):
@@ -619,11 +724,15 @@ class AutoRound(object):
         Returns:
             bool: True if the format is supported, False otherwise.
         """
+        if format == "fake":
+            return format
         format = format.replace("q*_", f"q{self.bits}_")
-        # only support to export afp8
+        # Only support to export afp8/nv_fp
         if self.act_bits <= 8:
-            if "fp8" not in self.act_data_type or self.act_dynamic:
+            if not is_standard_fp(self.act_data_type) or self.act_dynamic:
                 if format == "llmcompressor":
+                    if is_nv_fp(self.act_data_type):
+                        return format
                     bits, group_size, sym, act_bits = 8, -1, True, 8
                     assert (
                         self.bits == bits
@@ -636,17 +745,17 @@ class AutoRound(object):
                         f" W{self.bits}A{self.act_bits} model, but got bits={self.bits},"
                         f" group_size={self.group_size}, sym={self.sym}, act_bits={self.act_bits}"
                     )
-                elif format != "fake":
+                elif format != "fake" and not is_nv_fp(format):
                     logger.warning(
                         "Currently only support to export auto_round format quantized model"
-                        " with fp8 dtype activation for activation quantization."
+                        " with fp8 or nv_fp4 dtype activation for activation quantization."
                         " Change format to fake and save."
                     )
                     format = "fake"
             else:
                 if not (format == "auto_round" or format == "auto_round:fp8"):
                     logger.warning(
-                        f"Currently only support to export auto_round format for static W{self.bits}AFP8 model,"
+                        f"Currently only support to export auto_round or fake format for static W{self.bits}AFP8 model,"
                         " change format to auto_round"
                     )
                     format = "auto_round"
@@ -691,7 +800,7 @@ class AutoRound(object):
         self.orig_output_dir = output_dir
 
         # check and update the format based on the current configuration
-        format_list = self.parse_format_to_list(format)
+        format_list = self._parse_format_to_list(format)
         self.formats = format_list
 
         # If multiple formats are specified, enforce inplace=False
@@ -701,8 +810,13 @@ class AutoRound(object):
         kwargs.pop("inplace", None)
 
         # Perform model quantization
-        model, _ = self.quantize()
+        if self.static_kv_dtype is not None:
+            from auto_round.experimental.kv_cache import kvcache_quant_context
 
+            with kvcache_quant_context(self.model, static_kv_dtype=self.static_kv_dtype):
+                model, _ = self.quantize()
+        else:
+            model, _ = self.quantize()
         # Save the quantized model in the specified format_list
         folders = []
         for format in format_list:
@@ -785,7 +899,8 @@ class AutoRound(object):
                     **{k: config[k] for k in ["bits", "group_size", "super_bits", "super_group_size", "scale_dtype"]},
                 )
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e) or "MODULE:PT_DEVMEM" in str(e):
+                cuda_error_msg = traceback.format_exc()
+                try:
                     logger.info("out of VRAM, falling back to CPU.")
                     weight, scale, zp = quant_func(
                         module.weight.to("cpu"),
@@ -794,7 +909,8 @@ class AutoRound(object):
                             for k in ["bits", "group_size", "super_bits", "super_group_size", "scale_dtype"]
                         },
                     )
-                else:
+                except Exception as e:
+                    logger.error(cuda_error_msg)
                     raise
 
             # Overwrite the module's weights with the quantized version
@@ -805,8 +921,10 @@ class AutoRound(object):
                 if isinstance(value, dict):
                     for k, v in value.items():
                         setattr(module, k if k == "scale" else f"w_{k}", v.cpu())
-                else:
+                elif isinstance(value, torch.Tensor):
                     setattr(module, param_name, value.cpu())
+                else:
+                    setattr(module, param_name, value)
 
             # Update config
             self.layer_config.setdefault(name, {}).update(config)
@@ -833,9 +951,14 @@ class AutoRound(object):
         logger.info("start to compute imatrix for GGUF quantization.")
 
         # Load dataset
-        from .calib_dataset import get_dataloader
+        from auto_round.calib_dataset import get_dataloader
+
+        if hasattr(self.model, "is_fp8"):
+            convert_fp8_model_to_16b_model(self.model, self.amp_dtype)
 
         if isinstance(self.dataset, str):
+            if self.tokenizer is None:
+                raise ValueError("A tokenizer must be set for the model when using a dataset string.")
             dataset_name = self.dataset.replace(" ", "")
             self.dataloader = get_dataloader(
                 self.tokenizer, self.seqlen, dataset_name, self.seed, self.batch_size, self.nsamples
@@ -863,7 +986,7 @@ class AutoRound(object):
                     module.imatrix = squared
                     module.imatrix_cnt = input.shape[0]
                 else:
-                    module.imatrix += squared
+                    module.imatrix += squared.to(module.imatrix.device)
                     module.imatrix_cnt += input.shape[0]
 
             hook_handles = []
@@ -906,8 +1029,6 @@ class AutoRound(object):
 
                 accelerate.hooks.remove_hook_from_submodules(model)
             # Perform quantization using RTN
-            from tqdm import tqdm
-
             pbar = tqdm(all_to_quantized_module_names)
             block_names_cnt = len(flatten_list(get_block_names(self.model, True)))
             clear_mem_freq = len(all_to_quantized_module_names) // block_names_cnt
@@ -922,37 +1043,38 @@ class AutoRound(object):
                     cnt = 1
                 cnt += 1
         except RuntimeError as e:
-            if "CUDA out of memory" in str(e) or "MODULE:PT_DEVMEM" in str(e):
+            try:
+                if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
+                    import accelerate
+
+                    accelerate.hooks.remove_hook_from_submodules(model)
+                # Fallback: out-of-memory → try CPU blockwise quantization
+                logger.warning("Out of VRAM, falling back to blockwise quantization. Accuracy may degrade.")
+                model = model.to("cpu")
+                clear_memory()
+                self.quantize_via_rtn_blockwise(all_to_quantized_module_names)
+            except RuntimeError as e:
+                cuda_error_msg = traceback.format_exc()
                 try:
+                    # Final fallback: warn and use CPU-only quantization
+                    logger.warning(
+                        "Fallback to CPU. "
+                        "Consider enabling `low_gpu_mem_usage` or using more GPUs via `--device 0,1,2,3`."
+                    )
+                    model = model.to("cpu")
+                    clear_memory()
                     if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
                         import accelerate
 
                         accelerate.hooks.remove_hook_from_submodules(model)
-                    # Fallback: out-of-memory → try CPU blockwise quantization
-                    logger.warning("Out of VRAM, falling back to blockwise quantization. Accuracy may degrade.")
-                    model = model.to("cpu")
-                    clear_memory()
+
+                    orig_device = self.device
+                    self.device = "cpu"
                     self.quantize_via_rtn_blockwise(all_to_quantized_module_names)
-                except RuntimeError as e:
-                    if "CUDA out of memory" in str(e) or "MODULE:PT_DEVMEM" in str(e):
-                        # Final fallback: warn and use CPU-only quantization
-                        logger.warning(
-                            "Fallback to CPU. "
-                            "Consider enabling `low_gpu_mem_usage` or using more GPUs via `--device 0,1,2,3`."
-                        )
-                        model = model.to("cpu")
-                        clear_memory()
-                        if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
-                            import accelerate
-
-                            accelerate.hooks.remove_hook_from_submodules(model)
-
-                        orig_device = self.device
-                        self.device = "cpu"
-                        self.quantize_via_rtn_blockwise(all_to_quantized_module_names)
-                        self.device = orig_device
-                    else:
-                        raise
+                    self.device = orig_device
+                except Exception as e:
+                    logger.error(cuda_error_msg)
+                    raise
         finally:
             # Always remove hooks
             for hook in hooks:
@@ -1060,6 +1182,11 @@ class AutoRound(object):
         """
         m = get_module(self.model, name)
 
+        # if m.__class__.__name__ == "FP8Linear":
+        if hasattr(m, "is_fp8_linear"):
+            m = convert_fp8_layer_to_linear(m, self.amp_dtype)
+            set_module(self.model, name, m)
+
         # Step 1: Use optimized RTN data type if available
         if not self.disable_opt_rtn and not m.data_type.startswith("rtn_"):
             from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
@@ -1086,7 +1213,9 @@ class AutoRound(object):
                 m = m.unwrapper({})
                 m.to("cpu")
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e) or "MODULE:PT_DEVMEM" in str(e):
+                cuda_error_msg = traceback.format_exc()
+                m = m.orig_layer if hasattr(m, "orig_layer") else m
+                try:
                     logger.warning("Out of VRAM, falling back to CPU.")
                     m.to("cpu")
                     m = WrapperLinear(
@@ -1096,7 +1225,8 @@ class AutoRound(object):
                         enable_round_tuning=False,
                     )
                     m = m.unwrapper({})
-                else:
+                except Exception as e:
+                    logger.error(cuda_error_msg)
                     raise
 
         # Step 3: Optional immediate packing/export
@@ -1146,6 +1276,21 @@ class AutoRound(object):
 
         all_to_quantized_module_names: list[str] = [n for n, m in self.model.named_modules() if check_to_quantized(m)]
 
+        if is_nv_fp(self.data_type):
+            from auto_round.data_type.nvfp import calculate_gparam
+            from auto_round.data_type.utils import update_fused_layer_global_scales
+
+            pbar = tqdm(all_to_quantized_module_names)
+            for name in pbar:
+                pbar.set_description(f"Calculate weight global scale: {name}")
+                m = get_module(self.model, name)
+                weight_global_scale = calculate_gparam(m.weight, self.group_size)
+                setattr(m, "weight_global_scale", weight_global_scale)
+
+            modules = list(self.model.modules())
+            for module in tqdm(modules, desc="Update weight global scale for fuse module"):
+                update_fused_layer_global_scales(module)
+
         has_gguf_k = any("gguf" in fmt and "k" in fmt for fmt in getattr(self, "formats", []))
 
         self.quantize_embedding_layer()
@@ -1187,7 +1332,9 @@ class AutoRound(object):
                     clear_memory()
                     cnt = 1
                 cnt += 1
-
+        # Convert remaining fp8
+        if hasattr(self.model, "is_fp8"):
+            convert_fp8_model_to_16b_model(self.model, self.amp_dtype)
         self.quantized = True
         return self.model, self.layer_config
 
@@ -1204,7 +1351,16 @@ class AutoRound(object):
             raise ValueError("Could not find any blocks. Check the model or quant_block_list.")
 
         all_first_block_names = [block[0] for block in all_blocks]
-        all_inputs = self.cache_inter_data(all_first_block_names, self.nsamples)
+        if self.act_bits < 16 and not self.act_dynamic:
+            layer_names = self.get_quantized_layer_names_outside_blocks()
+            if len(layer_names) > 0:
+                logger.warning(
+                    "quantize layers outside blocks for static activation quantizaiton"
+                    " will significantly increase calibration time"
+                )
+            all_inputs = self.try_cache_inter_data_gpucpu(all_first_block_names, self.nsamples, layer_names)
+        else:
+            all_inputs = self.cache_inter_data(all_first_block_names, self.nsamples)
 
         # Clear hooks for multi-GPU setups
         if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
@@ -1245,6 +1401,8 @@ class AutoRound(object):
                 pbar.set_description(f"Quantizing {block_name}")
                 block = get_module(self.model, block_name)
                 block = block.to(self.device)
+                if hasattr(self.model, "is_fp8"):
+                    convert_fp8_model_to_16b_model(block, dtype=self.amp_dtype)
                 # Dispatch model if needed
                 if self.device_map is not None:
                     from accelerate import dispatch_model
@@ -1257,7 +1415,6 @@ class AutoRound(object):
                         add_hook_to_module(m, hook, True)
                 else:
                     block = block.to(self.device)
-
                 input_ids = self.get_block_outputs(
                     block,
                     input_ids,
@@ -1269,6 +1426,13 @@ class AutoRound(object):
                 if self.device_map is not None:
                     accelerate.hooks.remove_hook_from_submodules(block)
 
+                if (
+                    is_nv_fp(self.act_data_type) and any("nv_fp" in format_ for format_ in self.formats)
+                ) or is_static_afp8(self):
+                    from auto_round.utils import set_amax_for_all_moe_layers
+
+                    # enable moe experts act_max automatic generation for linears
+                    set_amax_for_all_moe_layers(block, attr_name="act_max")
                 # Normalize imatrix and quantize layers
                 for _, m in block.named_modules():
                     if hasattr(m, "imatrix"):
@@ -1325,7 +1489,13 @@ class AutoRound(object):
             formats = self.formats
             if (
                 len(formats) == 1
-                and ("awq" in formats[0] or "gptq" in formats[0] or "auto_round" in formats[0] or "gguf" in formats[0])
+                and (
+                    "awq" in formats[0]
+                    or "gptq" in formats[0]
+                    or "auto_round" in formats[0]
+                    or "gguf" in formats[0]
+                    or "llmcompressor" in formats[0]
+                )
                 and self.inplace
             ):
                 self.is_packing_immediate = True
@@ -1365,10 +1535,13 @@ class AutoRound(object):
         self.model = mv_module_from_gpu(self.model, self.low_cpu_mem_usage)
         clear_memory()
         if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
-            accelerate.hooks.remove_hook_from_submodules(self.model)  ##self.model.hf_device_map has not been changed
+            accelerate.hooks.remove_hook_from_submodules(self.model)  # self.model.hf_device_map has not been changed
         self.model = mv_module_from_gpu(self.model, self.low_cpu_mem_usage)
         logger.info("caching done")
-        pbar = tqdm(range(0, sum([len(i) for i in all_blocks]), self.nblocks))
+        if len(all_blocks) > 1:
+            pbar = tqdm(range(0, sum([len(i) for i in all_blocks]), self.nblocks))
+        else:
+            pbar = None  # move the alg warning outside pbar
 
         for block_names in all_blocks:
             inputs = all_inputs[block_names[0]]
@@ -1397,14 +1570,14 @@ class AutoRound(object):
                     logger.warning(f"force the train batch size to {total_samples}")
 
             if self.iters == 0:
-                # if not hasattr(self.model, "no_mix"):
-                #     self.auto_mix_rtn(self.model,
-                #         inputs,
-                #         block_names,
-                #         q_input=q_inputs["input_ids"] if q_inputs is not None else None,
-                #         nblocks=self.nblocks,
-                #         device=self.device,
-                #         pbar=pbar)
+                if not hasattr(self.model, "no_mix"):
+                    self.auto_mix_rtn(self.model,
+                        inputs,
+                        block_names,
+                        q_input=q_inputs["input_ids"] if q_inputs is not None else None,
+                        nblocks=self.nblocks,
+                        device=self.device,
+                        pbar=pbar)
                 return self.quantize_rtn()
 
             self.quant_blocks(
@@ -1423,6 +1596,12 @@ class AutoRound(object):
                 )
 
         self.quant_layers(layer_names, all_inputs)  ##TODO pack layer immediately
+
+        if hasattr(self.model, "is_fp8"):
+            for n, m in self.model.named_modules():
+                if hasattr(m, "is_fp8_linear"):
+                    new_layer = convert_fp8_layer_to_linear(m, self.amp_dtype).to("cpu")
+                    set_module(self.model, n, new_layer)
 
         end_time = time.time()
         cost_time = end_time - self.start_time
@@ -1461,17 +1640,22 @@ class AutoRound(object):
         """
         ##TODO currently we take all the layers outside blocks as post block layers which is not optimal
         ## if there is no input for layer, we use rtn
+
         for layer_name in copy.deepcopy(layer_names):
             if layer_name not in layer_inputs:
                 logger.info(f"using rtn to quantize {layer_name}")
                 from auto_round.data_type import QUANT_FUNC_WITH_DTYPE
 
                 layer = get_module(self.model, layer_name)
+                if hasattr(layer, "is_fp8"):
+                    new_layer = convert_fp8_layer_to_linear(layer, self.amp_dtype).to(self.device)
+                    set_module(self.model, layer_name, new_layer)
+                    layer = new_layer
+
                 if not self.disable_opt_rtn and "rtn_" + layer.data_type in QUANT_FUNC_WITH_DTYPE:
                     layer.data_type = "rtn_" + layer.data_type
                     logger.info("using optimized rtn method for quantizing %s", layer_name)
                     self.layer_config[layer_name]["data_type"] = layer.data_type
-                layer.to(self.device)
                 wrapper_layer = WrapperLinear(
                     layer,
                     enable_round_tuning=False,
@@ -1534,24 +1718,14 @@ class AutoRound(object):
                   otherwise returns False.
         """
         # Get the names of layers in quantization blocks
-        layers_in_blocks = get_layer_names_in_block(self.model, self.supported_types, self.quant_block_list)
+        supported_types = self.supported_types
+        layers_in_blocks = get_layer_names_in_block(
+            self.model, supported_types, self.quant_block_list, self.inner_supported_types
+        )
         ##process regex in layer_config
         all_supported_layer_names = []
         # List of configuration keys
-        keys = [
-            "bits",
-            "group_size",
-            "sym",
-            "data_type",
-            "scale_dtype",
-            "act_bits",
-            "act_group_size",
-            "act_sym",
-            "act_dynamic",
-            "act_data_type",
-            "super_bits",
-            "super_group_size",
-        ]
+        keys = get_quant_keys()
 
         for n, m in self.model.named_modules():
             # Delete previous configuration to avoid conflicts with prior tuning
@@ -1559,10 +1733,7 @@ class AutoRound(object):
                 if hasattr(m, key):
                     delattr(m, key)
 
-            # Skip unsupported types
-            supported_types = self.supported_types
-
-            if not isinstance(m, supported_types):
+            if not isinstance(m, supported_types) and m.__class__.__name__ not in self.inner_supported_types:
                 continue
             all_supported_layer_names.append(n)
 
@@ -1581,16 +1752,15 @@ class AutoRound(object):
                     layer_config[match_name] = val
             else:
                 tmp_m = get_module(self.model, name)
-                if not isinstance(tmp_m, torch.nn.Embedding):  ##TODO not good code style
+                if not isinstance(tmp_m, torch.nn.Embedding):  # TODO not good code style
                     raise ValueError(f"key {name} in layer_config is invalid, please have a double check")
 
         has_qlayer_outside_block = False  # Flag to track if there are quantized layers outside blocks (e.g., lm-head)
 
         # Iterate through all modules in the model
         for n, m in self.model.named_modules():
-
             # Skip unsupported types
-            if not isinstance(m, supported_types):
+            if not isinstance(m, supported_types) and m.__class__.__name__ not in self.inner_supported_types:
                 continue
 
             # If the layer is not in the config and is part of a quantization block, use default configuration
@@ -1598,12 +1768,28 @@ class AutoRound(object):
                 layer_config[n] = {}
                 for key in keys:
                     layer_config[n][key] = getattr(self, key)
+
             # If the layer is partially configured, fill in missing values
             elif n in layer_config.keys():
                 for key in keys:
                     if key not in layer_config[n].keys():
                         layer_config[n][key] = getattr(self, key)
                 layer_config[n]["fixed_by_user"] = True
+                # Check dtype and act_dtype
+                tmp_bits = infer_bits_by_data_type(layer_config[n]["data_type"])
+                if tmp_bits is not None and tmp_bits != layer_config[n]["bits"]:
+                    logger.warning(
+                        f"'data_type' do not match the specified 'bits' setting for {n}."
+                        f" Resetting 'bits' to {tmp_bits}."
+                    )
+                    layer_config[n]["bits"] = tmp_bits
+                tmp_act_bits = infer_bits_by_data_type(layer_config[n]["act_data_type"])
+                if tmp_act_bits is not None and tmp_act_bits != layer_config[n]["act_bits"]:
+                    logger.warning(
+                        f"'act_data_type' do not match the specified 'act_bits' setting for {n}."
+                        f" Resetting 'act_bits' to {tmp_act_bits}."
+                    )
+                    layer_config[n]["act_bits"] = tmp_act_bits
             # If the layer is not in the config and not part of a quantization block,
             # use default configuration and set specific values
             else:
@@ -1799,37 +1985,52 @@ class AutoRound(object):
         Raises:
             Exception: If caching on GPU fails, switches to CPU and caches there.
         """
+        if hasattr(self.model, "is_fp8"):
+            layer_names = []
         if layer_names is None:
             layer_names = []
-        try:
-            if not self.model.device.type == "meta":
-                if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
-                    pass
-                else:
-                    self.model = self.model.to(self.device)
-            all_inputs = self.cache_inter_data(
-                block_names, nsamples, layer_names=layer_names, last_cache_name=last_cache_name
-            )
-        except RuntimeError as e:
-            if "CUDA out of memory" in str(e) or "MODULE:PT_DEVMEM" in str(e):
-                logger.info("switch to cpu to cache block inputs")
-                if self.has_qlayer_outside_block or self.__class__.__name__ == "AutoRoundMLLM":
-                    logger.warning(
-                        "we strongly recommend using more GPUs in calibration."
-                        " Otherwise, some layers may fall back to `rtn` mode, which can affect accuracy."
-                    )
-                if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
-                    accelerate.hooks.remove_hook_from_submodules(
-                        self.model
-                    )  ##self.model.hf_device_map has not been changed
-                self.model = mv_module_from_gpu(self.model, self.low_cpu_mem_usage)
-                clear_memory()
-                ## Important change after v0.51, on cpu, we use rtn mode for layers in layer_names
+
+        if self.low_gpu_mem_usage or (
+            str(self.model.device == "cpu")
+            and len(block_names) == 1
+            and len(layer_names) == 0
+            and not self.has_qlayer_outside_block
+            and (last_cache_name is None or last_cache_name in block_names)
+        ):
+            ## low_gpu_mem_usage or calibrate only the embedding layer, which is also very fast on CPU
+            all_inputs = self.cache_inter_data(block_names, nsamples, layer_names=[], last_cache_name=last_cache_name)
+        else:
+            try:
+                if not self.model.device.type == "meta":
+                    if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
+                        pass
+                    else:
+                        self.model = self.model.to(self.device)
                 all_inputs = self.cache_inter_data(
-                    block_names, nsamples, layer_names=[], last_cache_name=last_cache_name
+                    block_names, nsamples, layer_names=layer_names, last_cache_name=last_cache_name
                 )
-            else:
-                raise
+            except RuntimeError as e:
+                cuda_error_msg = traceback.format_exc()
+                try:
+                    logger.info("switch to cpu to cache block inputs")
+                    if self.has_qlayer_outside_block or self.__class__.__name__ == "AutoRoundMLLM":
+                        logger.warning(
+                            "we strongly recommend using more GPUs in calibration."
+                            " Otherwise, some layers may fall back to `rtn` mode, which can affect accuracy."
+                        )
+                    if hasattr(self.model, "hf_device_map") and len(self.model.hf_device_map) > 1:
+                        accelerate.hooks.remove_hook_from_submodules(
+                            self.model
+                        )  ##self.model.hf_device_map has not been changed
+                    self.model = mv_module_from_gpu(self.model, self.low_cpu_mem_usage)
+                    clear_memory()
+                    ## Important change after v0.51, on cpu, we use rtn mode for layers in layer_names
+                    all_inputs = self.cache_inter_data(
+                        block_names, nsamples, layer_names=[], last_cache_name=last_cache_name
+                    )
+                except Exception as e:
+                    logger.error(cuda_error_msg)
+                    raise
         return all_inputs
 
     @torch.no_grad()
@@ -2068,12 +2269,14 @@ class AutoRound(object):
                 unwrapper_layer(self.model, wrapper_linear, layer_name, {})
             mv_module_from_gpu(layer, self.low_cpu_mem_usage)
 
+        lr = torch.tensor(self.lr)
+        minmax_lr = torch.tensor(self.minmax_lr)
         if self.enable_minmax_tuning:
             optimizer = self.optimizer(
-                [{"params": round_params}, {"params": minmax_params, "lr": self.minmax_lr}], lr=self.lr, weight_decay=0
+                [{"params": round_params}, {"params": minmax_params, "lr": minmax_lr}], lr=lr, weight_decay=0
             )
         else:
-            optimizer = self.optimizer(round_params, lr=self.lr, weight_decay=0)
+            optimizer = self.optimizer(round_params, lr=lr, weight_decay=0)
 
         if self.lr_scheduler is None:
             lr_schedule = torch.optim.lr_scheduler.LinearLR(
@@ -2168,12 +2371,20 @@ class AutoRound(object):
         def get_act_max_hook(module, input, output):
             if isinstance(input, (tuple, list)):
                 input = input[0]
+            if input.numel() == 0:
+                return  # as no needs for act_max update
             input, _, _ = reshape_pad_tensor_by_group_size(input, self.act_group_size)
             act_max = torch.max(torch.abs(input), dim=-1).values
-            if not hasattr(module, "act_max"):
+            if not hasattr(module, "act_max") or module.act_max.numel() == 0:
                 module.act_max = act_max
             else:
-                module.act_max = torch.max(act_max.to(module.act_max.device), module.act_max)
+                act_max = act_max.to(module.act_max.device)
+                if is_nv_fp(self.data_type):  ## for nvfp per-tensor input_global_scale calculation usage
+                    module.act_max = torch.max(
+                        torch.tensor([act_max.max(), module.act_max.max()], device=act_max.device)
+                    )
+                else:
+                    module.act_max = torch.max(act_max, module.act_max)
 
         hook_handles = []
 
@@ -2207,273 +2418,417 @@ class AutoRound(object):
         clear_memory()
         for n, m in model.named_parameters():
             m.requires_grad_(False)
-        input_ids = inputs["input_ids"]
-        inputs.pop("input_ids", None)
-        input_others = inputs
-        clear_memory()
-        input_ids = to_device(input_ids, self.cache_device)
-        input_others = to_device(input_others, self.cache_device)
-        ## as in calibration phase, we may use bf16 for calibration due to low_gpu_memory usage
-        tmp_dtype = self.amp_dtype if self.amp else torch.float32
-        for i in range(len(input_ids)):
-            input_ids[i] = input_ids[i].to(tmp_dtype)
+        # input_ids = inputs["input_ids"]
+        # inputs.pop("input_ids", None)
+        # input_others = inputs
+        # clear_memory()
+        # input_ids = to_device(input_ids, self.cache_device)
+        # input_others = to_device(input_others, self.cache_device)
+        # ## as in calibration phase, we may use bf16 for calibration due to low_gpu_memory usage
+        # tmp_dtype = self.amp_dtype if self.amp else torch.float32
+        # for i in range(len(input_ids)):
+        #     input_ids[i] = input_ids[i].to(tmp_dtype)
 
-        for key in input_others.keys():
-            if isinstance(input_others[key], torch.Tensor) and (
-                input_others[key].dtype == torch.float16 or input_others[key].dtype == torch.bfloat16
-            ):
-                input_others[key] = input_others[key].to(tmp_dtype)
-            elif isinstance(input_others[key], list):
-                for i in range(len(input_others[key])):
-                    to_dtype(input_others[key][i], tmp_dtype)
-        if self.enable_torch_compile:
-            quant_block = compile_func(self.quant_block, device)
-        else:
-            quant_block = self.quant_block
+        # for key in input_others.keys():
+        #     if isinstance(input_others[key], torch.Tensor) and (
+        #         input_others[key].dtype == torch.float16 or input_others[key].dtype == torch.bfloat16
+        #     ):
+        #         input_others[key] = input_others[key].to(tmp_dtype)
+        #     elif isinstance(input_others[key], list):
+        #         for i in range(len(input_others[key])):
+        #             to_dtype(input_others[key][i], tmp_dtype)
+        # if self.enable_torch_compile:
+        #     quant_block = compile_func(self.quant_block, device)
+        # else:
+        #     quant_block = self.quant_block
 
-        if pbar is None:
-            pbar = tqdm(range(0, len(block_names), nblocks))
+        # if pbar is None:
+        #     pbar = tqdm(range(0, len(block_names), nblocks))
         
-        for format in self.formats:
-            if format.startswith("gguf"):
-                target_gguf_format = format
-                default_config = GGUF_CONFIG[target_gguf_format]
-                split_list = re.split(":|_", target_gguf_format)
-            else:
-                default_config = {
-                "bits": 4,
-                "act_bits": 4,
-                "super_bits": 6,
-                "group_size": 32,
-                "data_type": "mx_fp",
-                }
+        # for format in self.formats:
+        #     if format.startswith("gguf"):
+        #         target_gguf_format = format
+        #         default_config = GGUF_CONFIG[target_gguf_format]
+        #         split_list = re.split(":|_", target_gguf_format)
+        #     else:
+        #         default_config = {
+        #         "bits": 4,
+        #         "act_bits": 4,
+        #         "super_bits": 6,
+        #         "group_size": 32,
+        #         "data_type": "mx_fp",
+        #         "act_data_type": "mx_fp_rceil",
+        #         }
                 
 
-        # if target_gguf_format is None:
-        #     logger.info("target_gguf_format is None, return")
-        #     return
+        # # if target_gguf_format is None:
+        # #     logger.info("target_gguf_format is None, return")
+        # #     return
 
-        names = block_names[0:len(block_names)]
-        # pbar.set_description(f"Quantizing [{i + 1}-{min(i + nblocks, len(block_names))}]/{len(block_names)}")
-        modules = [get_module(model, n).to(device) for n in names]
-        out = []
-        #get output
-        if self.device_map is not None:
-            from accelerate import dispatch_model
+        # names = block_names[0:len(block_names)]
+        # # pbar.set_description(f"Quantizing [{i + 1}-{min(i + nblocks, len(block_names))}]/{len(block_names)}")
+        # modules = [get_module(model, n).to(device) for n in names]
+        # out = []
+        # #get output
+        # if self.device_map is not None:
+        #     from accelerate import dispatch_model
 
-            for n, m in model.named_modules():
-                if len(list(m.children())) != 0 or not hasattr(m, "tuning_device"):
-                    continue
-                from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+        #     for n, m in model.named_modules():
+        #         if len(list(m.children())) != 0 or not hasattr(m, "tuning_device"):
+        #             continue
+        #         from accelerate.hooks import AlignDevicesHook, add_hook_to_module
 
-                hook = AlignDevicesHook(m.tuning_device, io_same_device=True)
-                add_hook_to_module(m, hook, True)
+        #         hook = AlignDevicesHook(m.tuning_device, io_same_device=True)
+        #         add_hook_to_module(m, hook, True)
 
-        if q_input is None:
-            hook_handles = self.register_act_max_hook(model)
+        # if q_input is None:
+        #     hook_handles = self.register_act_max_hook(model)
             
-            for module in modules:
-                cur_output = self.get_block_outputs(
-                module, input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, self.cache_device)
-                cur_output = [x.to("cpu") for x in cur_output]
-                out.append(cur_output)
+        #     for module in modules:
+        #         cur_output = self.get_block_outputs(
+        #         module, input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, self.cache_device)
+        #         cur_output = [x.to("cpu") for x in cur_output]
+        #         out.append(cur_output)
 
-            for handle in hook_handles:
-                handle.remove()
-        else:
-            for module in modules:
-                cur_output = self.get_block_outputs(
-                module, input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, self.cache_device)
-                cur_output = [x.to("cpu") for x in cur_output]
-                out.append(cur_output)
-            hook_handles = self.register_act_max_hook(model)
-            if hook_handles:
-                self.get_block_outputs(
-                    model,
-                    q_input,
-                    input_others,
-                    self.batch_size * self.infer_bs_coeff,
-                    device,
-                    self.cache_device,
-                    save_output=False,
-                )
+        #     for handle in hook_handles:
+        #         handle.remove()
+        # else:
+        #     for module in modules:
+        #         cur_output = self.get_block_outputs(
+        #         module, input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, self.cache_device)
+        #         cur_output = [x.to("cpu") for x in cur_output]
+        #         out.append(cur_output)
+        #     hook_handles = self.register_act_max_hook(model)
+        #     if hook_handles:
+        #         self.get_block_outputs(
+        #             model,
+        #             q_input,
+        #             input_others,
+        #             self.batch_size * self.infer_bs_coeff,
+        #             device,
+        #             self.cache_device,
+        #             save_output=False,
+        #         )
 
-            for handle in hook_handles:
-                handle.remove()
+        #     for handle in hook_handles:
+        #         handle.remove()
+        
+        # # from utils import layerwise_error_decomposition
+        # from collections import defaultdict
+        # # layerwise_error_decomposition(model,x,gt,"lrp",self.device)
+        # target_bit = 6
+        # overall_size = 0
+        # origin_size = 0
+        # quant_size = 0
+        # bits = []
+        # layer_names = []    
+        # count=0
+        # blocks_loss = defaultdict(lambda: defaultdict(list))
+        # for bit in bits:
+        #     blocks_loss[bit]={}
+        # #convert all block to default quant block and record the size
+        # for i in range(0, len(block_names), nblocks):
+        #     cur_n = block_names[i]
+        #     cur_m = get_module(model, cur_n)
+        #     cur_m = cur_m.to(device)
+           
+        #     for n, m in cur_m.named_modules():
+        #         if check_to_quantized(m):
+        #             layer_names.append(m.tmp_name)
+        #             bits.append(m.bits)
+
+        #     low_bit = min(bits)
+        #     high_bit = max(bits)
+        #     for n, m in cur_m.named_modules():
+        #         if format.startswith("gguf"):
+        #             if check_to_quantized(m):
+        #                 overall_size += (target_bit-4)*sum(p.numel() for p in m.parameters()) #TODO:临时设置，记得修改； 允许增加的size
+        #         else:
+        #             if isinstance(m, dict):
+        #                 d_bits = int(m.get("bits", 16))
+        #             else:
+        #                 d_bits = int(m.bits) if hasattr(m, "bits") else 16
+
+        #             if check_to_quantized(m):
+        #                 bits = [target_bit+2]
+        #                 count+=1
+        #                 overall_size += int(((target_bit-d_bits)*sum(p.numel() for p in m.parameters()))/self.size_factor) #TODO:临时设置，记得修改； 允许增加的size
+                    
+        #             origin_size += int((d_bits*sum(p.numel() for p in m.parameters()))/self.size_factor)
+        #         quant_size += int((target_bit*sum(p.numel() for p in m.parameters()))/self.size_factor) 
+
+        #     for n, m in cur_m.named_modules():
+        #         if isinstance(m, SUPPORTED_LAYER_TYPES) and check_to_quantized(m):
+        #             for key in default_config:
+        #                 setattr(m,key,default_config[key])
+        #             new_m = WrapperLinear(
+        #                 m,
+        #                 enable_minmax_tuning=self.enable_minmax_tuning,
+        #                 enable_norm_bias_tuning=self.enable_norm_bias_tuning,
+        #                 device=device,      
+        #             )
+        #             new_m = new_m.unwrapper({})
+        #             set_module(cur_m, n, new_m)
+        #     # quantized_layer_names, unquantized_layer_names = wrapper_block(
+        #     # cur_m, self.enable_minmax_tuning, self.enable_norm_bias_tuning, device=self.device
+        #     # )
+            
+        # # overall_size = int(overall_size*1/self.size_factor)
+        # # origin_size = int(origin_size/self.size_factor)
+        # # quant_size = int(quant_size/self.size_factor)
+        # logger.info(f"count:{count}")
+        # #start to select
+        # # cur_config = GGUF_CONFIG[f"gguf:q{high_bit}_{split_list[2]}"]
+        # mean_config = {
+        #             "bits": target_bit,
+        #             "act_bits": target_bit,
+        #             "super_bits": target_bit+2,
+        #             "group_size": 32,
+        #             "data_type": "mx_fp",
+        #             "act_data_type": "mx_fp_rceil",
+        #             }
+
+        # high_config = {
+        #             "bits": target_bit+2,
+        #             "act_bits": target_bit+2,
+        #             "super_bits": target_bit+4,
+        #             "group_size": 32,
+        #             "data_type": "mx_fp",
+        #             "act_data_type": "mx_fp_rceil",
+        #             }
+        # mix_configs={
+        #     target_bit+2:high_config,
+        # }
+        # for i in range(0, len(block_names), nblocks):
+        #     if i != 0:
+        #         pbar.update(1)
+        #     if nblocks == 1:
+        #         n = block_names[i]
+        #         pbar.set_description(f"Quantizing {n}")
+        #         m = get_module(model, n)
+        #     else:
+        #         names = block_names[i : min(i + nblocks, len(block_names))]
+        #         pbar.set_description(f"Quantizing [{i + 1}-{min(i + nblocks, len(block_names))}]/{len(block_names)}")
+        #         modules = [get_module(model, n) for n in names]
+        #         m = WrapperMultiblock(modules)
+
+        #     if not self.model.device.type == "meta" or self.low_cpu_mem_usage:
+        #         m = m.to(device)
+
+        #     if 1:
+        #         block_loss = self.get_block_loss(m,
+        #             input_ids,
+        #             input_others,
+        #             bits,
+        #             output=out[i],
+        #             length=len(block_names),
+        #             device=device,)
+        #         for bit,l_n in block_loss.items():
+        #             # for bb,nn in  block_loss:
+        #             blocks_loss[bit] = {**blocks_loss[bit],**block_loss[bit]}
+
+        #     else:
+        #         quant_block(
+        #             m,
+        #             input_ids,
+        #             input_others,
+        #             q_input=q_input,
+        #             device=device,
+        #         )
+
+        # del out
+        # #recover all block into orig 
+        # for i in range(0, len(block_names), nblocks):
+        #     cur_m_n = block_names[i]
+        #     cur_m = get_module(model, cur_m_n)
+        #     cur_m = cur_m.to(device)
+            
+        #     for n, m in cur_m.named_modules():
+        #         if hasattr(m,"orig_layer"):
+        #             set_module(cur_m, n, m.orig_layer)
+        #             module = get_module(cur_m,n)
+        #             self.layer_config[module.tmp_name] = default_config
+        #             for key in default_config:
+        #                 setattr(module, key, default_config[key])
+            
+        #     # for n, m in cur_m.named_modules():
+        #     #     if check_to_quantized(m):
+        #     #         for key in default_config:
+        #     #             setattr(cur_m, key, default_config[key])
+
+        # #DP
+        # from collections import defaultdict
+        # import numpy as np
+        # # def get_max_bit_size(f,bit):
+
+        # # 创建二维 defaultdict，每个元素默认是一个 list
+        
+        # # choosed_layer = defaultdict(lambda: defaultdict(list))
+        # viewd_layer = 0
+        
+        # layer_names = blocks_loss[min(bits)].keys()
+        # b=len(layer_names)
+        # f = np.zeros((len(layer_names)*len(bits),overall_size+1))
+        # weights = []
+        # names = []
+        # choosed_bits = []
+        # # logger.info(blocks_loss)
+        # # logger.info("+++++++++++++++++++++++")
+        # #init
+        # for bit in bits:
+        #     f_k = next(iter(blocks_loss[bit]))
+        #     v , w = blocks_loss[bit][f_k]
+        #     names.append(f_k)
+        #     weights.append(w)
+        #     choosed_bits.append(bit)
+        #     if v>0:
+        #         for V in range(w, overall_size+1):
+        #             f[0][V] = max(f[0][V],v)
 
         
+        # # logger.info(len(keys))
+        # # logger.info(keys)
+        # for layer_name in layer_names:
+        #     if viewd_layer == 0:
+        #         viewd_layer+=1*len(bits)
+        #         continue
+        #     # if viewd_layer==b:
+        #     #     break
+        #     for bit in bits:
+        #         loss, size = blocks_loss[bit][layer_name]
+        #         names.append(layer_name)#重名似乎也无所谓？
+        #         weights.append(size)
+        #         choosed_bits.append(bit)
+        #         for V in tqdm(range(1,overall_size+1)):
+        #             if size < V:
+        #                 if f[viewd_layer-1][V]>(f[viewd_layer-1][V-size]+loss):#不选择该bit的layer
+        #                     f[viewd_layer][V] = f[viewd_layer-1][V]
+        #                 else:#选择了
+        #                     f[viewd_layer][V] = f[viewd_layer-1][V-size]+loss
+        #             else:
+        #                 f[viewd_layer][V] = f[viewd_layer-1][V]
+                    
+        #             #  logger.info("choose default bit")    
+        #         viewd_layer+=1
 
-        overall_size = 0
-        bits = []
-        layer_names = []    
-        blocks_loss = {}
-        #convert all block to default quant block and record the size
-        for i in range(0, len(block_names), nblocks):
-            cur_n = block_names[i]
-            cur_m = get_module(model, cur_n)
-            cur_m = cur_m.to(device)
-           
-            for n, m in cur_m.named_modules():
-                if check_to_quantized(m):
-                    layer_names.append(m.tmp_name)
-                    bits.append(m.bits)
+        # # 回溯寻找哪些物品被取了
+        # w = overall_size
+        # viewd_layer-=1
+        # selected_names = []
+        # selected_bits = []
+        # for i in range(viewd_layer, 0, -1):#最后一个选不到，做特殊处理？
+        #     if f[i][w] != f[i - 1][w]:
+        #         selected_bits.append(choosed_bits[i])
+        #         selected_names.append(names[i])  # 记录物品索引
+        #         c_w = weights[i]
+        #         w -= c_w
+        #         # print(f"选择的物品：{names[i]}")
+        #         # print(f"选择的bit：{choosed_bits[i]}")
+        #         # print(f"当前值:{w}")
 
-            low_bit = min(bits)
-            high_bit = max(bits)
-            for n, m in cur_m.named_modules():
-                if check_to_quantized(m):
-                    overall_size += (6-4)*sum(p.numel() for p in m.parameters()) #TODO:临时设置，记得修改
+        # _,first_v = blocks_loss[bits[0]][f_k]
+        # if w>=weights[0] and first_v>=0:
+        #     selected_bits.append(choosed_bits[0])
+        #     selected_names.append(names[0])  # 记录物品索引
+        # # tmp_list.append(max_loss[1])
 
-            for n, m in cur_m.named_modules():
-                if isinstance(m, SUPPORTED_LAYER_TYPES) and check_to_quantized(m):
-                    for key in default_config:
-                        setattr(m,key,default_config[key])
-                    new_m = WrapperLinear(
-                        m,
-                        enable_minmax_tuning=self.enable_minmax_tuning,
-                        enable_norm_bias_tuning=self.enable_norm_bias_tuning,
-                        device=device,      
-                    )
-                    set_module(cur_m, n, new_m)
-            # quantized_layer_names, unquantized_layer_names = wrapper_block(
-            # cur_m, self.enable_minmax_tuning, self.enable_norm_bias_tuning, device=self.device
-            # )
-            
-        overall_size = int(overall_size*1/self.size_factor)
-        #start to select
-        # cur_config = GGUF_CONFIG[f"gguf:q{high_bit}_{split_list[2]}"]
+        # # logger.info(f"之前的：{cur_m}")
+        
+        # # logger.info(f"之后的：{cur_m}")
+        # logger.info(f"得到的value:{f[viewd_layer][overall_size]}\n选择的layer:{selected_names}")
+        # for i in range(len(selected_names)):
+        #     layer_name = selected_names[i]
+        #     layer_bit = selected_bits[i]
+        #     # ss, ww = blocks_loss[layer_name]
+        #     cur_config = mix_configs[layer_bit]
+        #     # logger.info(f"占用的size:{ww}")
+        #     module = get_module(model, layer_name)
+        #     print(layer_name)
+        #     for key in cur_config:
+        #         setattr(module, key, cur_config[key])
+        #     self.layer_config[module.tmp_name] = cur_config
+        length = 0
+        bit = 8
         cur_config = {
-                    "bits": 6,
-                    "act_bits": 6,
-                    "super_bits": 8,
+            "bits": bit,
+                    "act_bits": bit,
+                    "super_bits": bit+2,
                     "group_size": 32,
                     "data_type": "mx_fp",
-                    }
+                    "act_data_type": "mx_fp_rceil",
+        }
+        ii = 0
+        origin_size = 0
         for i in range(0, len(block_names), nblocks):
-            if i != 0:
-                pbar.update(1)
-            if nblocks == 1:
-                n = block_names[i]
-                pbar.set_description(f"Quantizing {n}")
-                m = get_module(model, n)
-            else:
-                names = block_names[i : min(i + nblocks, len(block_names))]
-                pbar.set_description(f"Quantizing [{i + 1}-{min(i + nblocks, len(block_names))}]/{len(block_names)}")
-                modules = [get_module(model, n) for n in names]
-                m = WrapperMultiblock(modules)
-
-            if not self.model.device.type == "meta" or self.low_cpu_mem_usage:
-                m = m.to(device)
-
-            if 1:
-                block_loss = self.get_block_loss(m,
-                    input_ids,
-                    input_others,
-                    bits,
-                    output=out[i],
-                    length=len(block_names),
-                    device=device,)
-                blocks_loss = {**blocks_loss,**block_loss}
-            else:
-                quant_block(
-                    m,
-                    input_ids,
-                    input_others,
-                    q_input=q_input,
-                    device=device,
-                )
-
-        del out
-        #recover all block into orig 
-        for i in range(0, len(block_names), nblocks):
-            cur_m_n = block_names[i]
-            cur_m = get_module(model, cur_m_n)
-            cur_m = cur_m.to(device)
-            
-            for n, m in cur_m.named_modules():
-                if hasattr(m,"orig_layer"):
-                    set_module(cur_m, n, m.orig_layer)
-                    module = get_module(cur_m,n)
-                    self.layer_config[module.tmp_name] = default_config
-                    for key in default_config:
-                        setattr(module, key, default_config[key])
-            
-            # for n, m in cur_m.named_modules():
-            #     if check_to_quantized(m):
-            #         for key in default_config:
-            #             setattr(cur_m, key, default_config[key])
-
-        #DP
-        from collections import defaultdict
-        import numpy as np
-        # 创建二维 defaultdict，每个元素默认是一个 list
-        
-        # choosed_layer = defaultdict(lambda: defaultdict(list))
-        viewd_layer = 0
-        f = np.zeros((len(blocks_loss),overall_size+1))
-        keys = blocks_loss.keys()
-        b=len(keys)
-        weights = []
-        names = []
-        # logger.info(blocks_loss)
-        # logger.info("+++++++++++++++++++++++")
-        #init
-        f_k = next(iter(blocks_loss))
-        v , w = blocks_loss[f_k]
-        names.append(f_k)
-        weights.append(w)
-        if v>0:
-            for V in range(w, overall_size+1):
-                f[0][V] = v
-
-        
-        for layer_name in keys:
-            if viewd_layer == 0:
-                viewd_layer+=1
-                continue
-            # if viewd_layer==b:
-            #     break
-            loss, size = blocks_loss[layer_name]
-            weights.append(size)
-            names.append(layer_name)
-            for V in tqdm(range(1,overall_size+1)):
-                if size < V:
-                    if f[viewd_layer-1][V]>(f[viewd_layer-1][V-size]+loss):
-                        f[viewd_layer][V] = f[viewd_layer-1][V]
-                    else:
-                        f[viewd_layer][V] = f[viewd_layer-1][V-size]+loss
-                    
+            cur_m = get_module(model,block_names[i])
+            for n,m in cur_m.named_modules():
+                if(check_to_quantized(m)):
+                    length+=1
+                if isinstance(m,dict):
+                    db = m.get("bits",16)
                 else:
-                    f[viewd_layer][V] = f[viewd_layer-1][V]
-            viewd_layer+=1
-
-        # 回溯寻找哪些物品被取了
-        w = overall_size
-        viewd_layer-=1
-        selected = []
-        for i in range(viewd_layer, 0, -1):
-            if f[i][w] != f[i - 1][w]:
-                selected.append(names[i])  # 记录物品索引
-                c_w = weights[i]
-                w -= c_w
-                # print(f"选择的物品：{names[i]}")
-                # print(f"当前值:{w}")
-
-        # tmp_list.append(max_loss[1])
-
-        # logger.info(f"之前的：{cur_m}")
+                    db = m.bits if hasattr(m,"bits") else 16
+                origin_size += int((db*sum(p.numel() for p in m.parameters()))/self.size_factor)
         
-        # logger.info(f"之后的：{cur_m}")
-        logger.info(f"得到的value:{f[viewd_layer][overall_size]}\n选择的layer:{selected}")
-        for layer_name in selected:
-            ss, ww = blocks_loss[layer_name]
-            # logger.info(f"占用的size:{ww}")
-            module = get_module(model, layer_name)
-            for key in cur_config:
-                setattr(module, key, cur_config[key])
-            self.layer_config[module.tmp_name] = cur_config
+        logger.info("----------------------------")
+        print(f"layer_len:{length}")
+        for i in range(0, len(block_names), nblocks):
+            cur_m = get_module(model,block_names[i])
+            for n,m in cur_m.named_modules():
+                if check_to_quantized(m):
+                    ii+=1
+                    # if ii <= length/2: #later
+                    #     print(f"后半{ii}")
+                    #     continue
+                    if ii >= length/2: #pre
+                        print(f"前半{ii}")
+                        break
+                    # if ii>=length/3 and ii<(2*length/3): #0.3
+                    #     logger.info(f"前后{ii}")
+                    #     continue
+                    # logger.info(f"占用的size:{ww}")
+                    module = get_module(cur_m, n)
+                    logger.info(module.tmp_name)
+                    for key in cur_config:
+                        setattr(module, key, cur_config[key])
+                    self.layer_config[module.tmp_name] = cur_config
+        logger.info("----------------------------")
+                
+               
 
-
+        #EXP:验证模型size
+        # print(f"all:layer:{len(layer_names)*len(bits)}")
+        # print(f"selected layer:{len(selected_names)}")
+        cur_size = 0
+        ii = 0
+        s_S = 0
+        for i in range(0, len(block_names), nblocks):
+            cur_m = get_module(model,block_names[i])
+            for n,m in cur_m.named_modules():
+                # cur_size += sum(p.numel() for p in m.parameters())
+                sss=m.tmp_name
+                config = m
+                if isinstance(config, dict):
+                    dbits = int(config.get("bits", 16))
+                elif hasattr(config, "orig_layer"):
+                    dbits = int(config.orig_layer.bits) if hasattr(config.orig_layer, "bits") else 16
+                else:
+                    dbits = int(config.bits) if hasattr(config, "bits") else 16
+                
+                cur_size += int((dbits*sum(p.numel() for p in m.parameters())/self.size_factor))
+                
+                # if sss in selected_names:
+                #     s_S += int(((selected_bits[len(selected_names)-ii-1]-4)*sum(p.numel() for p in m.parameters())/self.size_factor))
+         # cur_size = int(cur_size/self.size_factor)
+        # logger.info(f"overall_size:{overall_size}")
+        logger.info(f"origin_size:{origin_size}")
+        #logger.info(f"quant_size:{quant_size}")
+        logger.info(f"current_size:{cur_size}")
+        # s_S = 0
+        # for k in blocks_loss[8].keys():
+        #     _,si = blocks_loss[8][k]
+        #     s_S+=si
+        # logger.info(f"test:{s_S}")
     
     @torch.inference_mode()
     def get_block_loss(self, block, input_ids, input_others, bits, output=None,length=0, device=torch.device("cpu"),mode="percent", block_type="wrap"):
@@ -2497,15 +2852,19 @@ class AutoRound(object):
                 "super_bits": 6,
                 "group_size": 32,
                 "data_type": "mx_fp",
+                "act_data_type": "mx_fp_rceil",
                 }
                 # for k in quant_bits:
-                mix_configs[6] = {
-                "bits": 6,
-                "act_bits": 6,
-                "super_bits": 8,
-                "group_size": 32,
-                "data_type": "mx_fp",
-                    }
+                for bit in bits:
+                    mix_configs[bit] = {
+                    "bits": bit,
+                    "act_bits": bit,
+                    "super_bits": bit+2,
+                    "group_size": 32,
+                    "data_type": "mx_fp",
+                    "act_data_type": "mx_fp_rceil",
+                        }
+                # logger.info(f"选择的bit为：{bits}")
         # if target_gguf_format is None:
         #     logger.info("target_gguf_format is None, return")
         #     return
@@ -2561,44 +2920,20 @@ class AutoRound(object):
         mode=None,
         block_type=None,
     ):
-        each_loss = {}
+        from collections import defaultdict
+        each_loss = defaultdict(lambda: defaultdict(list))
         # bit = mix_configs.keys()[0]
-        [(_, cur_config)] = mix_configs.items()
+        # [(_, cur_config)] = mix_configs.items()
         # for layer_name in layer_names:
         #     module = get_module(block, layer_name)
         cur_block_num = int((block.tmp_name).split(".")[-1])
         w_value = (length-cur_block_num)/length
         w_value = 1
         for layer_name in layer_names:
-            module = get_module(block, layer_name)
-            # if block_type == "wrap" and hasattr(module,"orig_layer"):
-            #     set_module(block,layer_name,module.orig_layer)
-            #     module = get_module(block, layer_name)
-            # tmp_ori_layer[module.tmp_name] = self.layer_config[module.tmp_name]
-            # if block_type in {"wrap"}:
-            #     for key in cur_config:
-            #         setattr(module.orig_layer, key, cur_config[key])
-                # if mode in {"percent"}:
-            for key in cur_config:
-                setattr(module.orig_layer, key, cur_config[key])
-            # breakpoint()
-            # self.layer_config[module.tmp_name] = default_config
-            module = get_module(block, layer_name)
-            wrapper_layer = WrapperLinear(
-                module.orig_layer,
-                enable_minmax_tuning=False,
-                enable_round_tuning=False,
-                enable_norm_bias_tuning=False,
-                device=device,
-            )
-            set_module(block, layer_name, wrapper_layer)
-            q_output = self.get_block_outputs(
-                block, current_input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, cache_device
-            )
-
-            if mode in {"percent", "marginal income ratio"}:
-                for key in default_config:
-                    setattr(module.orig_layer, key, default_config[key])
+            for bit,cur_config in mix_configs.items():
+                module = get_module(block, layer_name)
+                for key in cur_config:
+                    setattr(module.orig_layer, key, cur_config[key])
                 module = get_module(block, layer_name)
                 wrapper_layer = WrapperLinear(
                     module.orig_layer,
@@ -2606,39 +2941,60 @@ class AutoRound(object):
                     enable_round_tuning=False,
                     enable_norm_bias_tuning=False,
                     device=device,
-                    )
-                set_module(block, layer_name, wrapper_layer)
-                q2_output = self.get_block_outputs(
-                block, current_input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, cache_device
                 )
-            
-            module = get_module(block, layer_name)
-            for key in default_config:
-                setattr(module, key, default_config[key])
-            
-            if mode == "max":
-                # cur_loss = 1/mse_loss(torch.stack(q_output).squeeze(1), current_output)#越好loss越大
-                cur_loss = 99-mse_loss(torch.stack(q_output).squeeze(1), current_output)#越好loss越大(值为负数)
-            elif mode == "cosine":
-                A =torch.stack(q_output).flatten(1,-1)
-                B = current_output.flatten(1,-1)
-                cur_loss = torch.mean(F.cosine_similarity(A,B))
-                # breakpoint()
-            elif mode == "sensitive":
-                cur_loss = -mse_loss(torch.stack(q_output).squeeze(1), current_output) #敏感度越大，loss掉的越多，所以要选择-loss小的
-            elif mode == "percent":
-                loss_high = mse_loss(torch.stack(q_output).squeeze(1), current_output)
-                loss_low = mse_loss(torch.stack(q2_output).squeeze(1), current_output)
-                cur_loss = -(loss_high - loss_low)/loss_low #改善率越高，值为正且越大
-                # print(cur_loss)
-            elif mode == "marginal income ratio":
-                loss_high = mse_loss(torch.stack(q_output).squeeze(1), current_output)
-                loss_low = mse_loss(torch.stack(q2_output).squeeze(1), current_output)
-                income = (loss_high - loss_low)/loss_low #改善率越高，值为负且越小
-                marginal = income/((cur_config["bits"]-default_config["bits"])*sum(a.numel() for a in module.parameters())) #边际收益越高值为负且越小
-                cur_loss = marginal
-            
-            each_loss[module.orig_layer.tmp_name] = (int(w_value*cur_loss*1e5)/1e5, int((cur_config["bits"]-default_config["bits"])*sum(p.numel() for p in module.parameters())/self.size_factor))  # 把每一层的loss以及size记录下来
+                set_module(block, layer_name, wrapper_layer)
+                q_output = self.get_block_outputs(
+                    block, current_input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, cache_device
+                )
+
+                if mode in {"percent", "marginal income ratio"}:
+                    for key in default_config:
+                        setattr(module.orig_layer, key, default_config[key])
+                    module = get_module(block, layer_name)
+                    wrapper_layer = WrapperLinear(
+                        module.orig_layer,
+                        enable_minmax_tuning=False,
+                        enable_round_tuning=False,
+                        enable_norm_bias_tuning=False,
+                        device=device,
+                        )
+                    set_module(block, layer_name, wrapper_layer)
+                    q2_output = self.get_block_outputs(
+                    block, current_input_ids, input_others, self.batch_size * self.infer_bs_coeff, device, cache_device
+                    )
+                
+                # module = get_module(block, layer_name)
+                # for key in default_config:
+                #     setattr(module, key, default_config[key])
+                
+                if mode == "max":
+                    # cur_loss = 1/mse_loss(torch.stack(q_output).squeeze(1), current_output)#越好loss越大
+                    cur_loss = 99-mse_loss(torch.stack(q_output).squeeze(1), current_output)#越好loss越大(值为负数)
+                    # loss_qattn[mxfp4]
+                    # loss_qattn[...]
+                    # [mxfp4,mbfp4,int4,int6,int8]
+                    # 不能跨block比较，不同block同一个layer可能会有较大差距
+                    # size
+                    # [4,6,8]
+                elif mode == "cosine":
+                    A =torch.stack(q_output).flatten(1,-1)
+                    B = current_output.flatten(1,-1)
+                    cur_loss = torch.mean(F.cosine_similarity(A,B))
+                elif mode == "sensitive":
+                    cur_loss = -mse_loss(torch.stack(q_output).squeeze(1), current_output) #敏感度越大，loss掉的越多，所以要选择-loss小的
+                elif mode == "percent":
+                    loss_high = mse_loss(torch.stack(q_output).squeeze(1), current_output)
+                    loss_low = mse_loss(torch.stack(q2_output).squeeze(1), current_output)
+                    cur_loss = -(loss_high - loss_low)/loss_low #改善率越高，值为正且越大
+                    # print(cur_loss)
+                elif mode == "marginal income ratio":
+                    loss_high = mse_loss(torch.stack(q_output).squeeze(1), current_output)
+                    loss_low = mse_loss(torch.stack(q2_output).squeeze(1), current_output)
+                    income = (loss_high - loss_low)/loss_low #改善率越高，值为负且越小
+                    marginal = income/((cur_config["bits"]-default_config["bits"])*sum(a.numel() for a in module.parameters())) #边际收益越高值为负且越小
+                    cur_loss = marginal
+                
+                each_loss[bit][module.orig_layer.tmp_name] = (int(w_value*cur_loss*1e5)/1e5, int(((cur_config["bits"]-default_config["bits"])*sum(p.numel() for p in module.parameters()))/self.size_factor))  # 把每一层的loss以及size记录下来
 
         return each_loss
 
@@ -2655,6 +3011,12 @@ class AutoRound(object):
         Returns:
         Tuple: (q_outputs, output) if self.enable_quanted_input is True, else (None, output)
         """
+        if hasattr(self.model, "is_fp8"):
+            for n, m in block.named_modules():
+                if hasattr(m, "is_fp8_linear"):
+                    new_layer = convert_fp8_layer_to_linear(m, self.amp_dtype).to(device)
+                    set_module(block, n, new_layer)
+
         if self.device_map is not None:
             from accelerate import dispatch_model
 
@@ -2710,7 +3072,12 @@ class AutoRound(object):
         quantized_layer_names, unquantized_layer_names = wrapper_block(
             block, self.enable_minmax_tuning, self.enable_norm_bias_tuning, device=self.device
         )
+        if is_nv_fp(self.data_type):  # enable qkv and moe structure global_scale fuse
+            from auto_round.data_type.utils import update_fused_layer_global_scales
 
+            modules = block.modules()
+            for module in modules:
+                update_fused_layer_global_scales(module)
         round_params = []
         minmax_params = []
         for n, m in block.named_modules():
@@ -2721,12 +3088,14 @@ class AutoRound(object):
                     else:
                         round_params.append(m.params[key])
 
+        lr = torch.tensor(self.lr)
+        minmax_lr = torch.tensor(self.minmax_lr)
         if self.enable_minmax_tuning:
             optimizer = self.optimizer(
-                [{"params": round_params}, {"params": minmax_params, "lr": self.minmax_lr}], lr=self.lr, weight_decay=0
+                [{"params": round_params}, {"params": minmax_params, "lr": minmax_lr}], lr=lr, weight_decay=0
             )
         else:
-            optimizer = self.optimizer(round_params, lr=self.lr, weight_decay=0)
+            optimizer = self.optimizer(round_params, lr=lr, weight_decay=0)
 
         if len(round_params) + len(minmax_params) <= 0:
             dump_info = (
@@ -2734,7 +3103,7 @@ class AutoRound(object):
                 f"layers in the block"
             )
             logger.info(dump_info)
-            unwrapper_block(block, {})  ## TODO Quant layer should change
+            unwrapper_block(block, {})  # TODO Quant layer should change
             mv_module_from_gpu(block, self.low_cpu_mem_usage)
             return output, output
 
@@ -2761,15 +3130,15 @@ class AutoRound(object):
         init_loss = None
         best_params = {}
         total_loss = 0
-
         for i in range(self.iters):
             total_loss = 0
             if self.sampler == "rand":
                 whole_indices = torch.randperm(nsamples)[:pick_samples]
-                ##we assume the block input and output shape is same
+                # We assume the block input and output shape is same
                 if self.gradient_accumulate_steps != 1:
                     current_input_ids = [input_ids[i] for i in whole_indices]
                     num_elm = sum(id.numel() for id in current_input_ids)
+
             for tmp_step in range(self.gradient_accumulate_steps):
                 indices = whole_indices[tmp_step * self.batch_size : (tmp_step + 1) * self.batch_size]
                 current_input_ids, current_input_others = AutoRound.sampling_inputs(
@@ -2783,7 +3152,6 @@ class AutoRound(object):
 
                 current_output = [output[x] for x in indices]
                 current_output = torch.cat(current_output, dim=self.batch_dim)
-
                 current_output = to_device(current_output, device)
 
                 output_q = block_forward(
@@ -2832,7 +3200,11 @@ class AutoRound(object):
             logger.info(f"{unquantized_layer_names} have not been quantized")
         with torch.no_grad():
             unwrapper_block(block, best_params)
+
         if self.enable_quanted_input:
+            if is_nv_fp(self.act_data_type) and any("nv_fp" in format_ for format_ in self.formats):
+                # Enable moe experts act_max automatic generation for WrapperWALayer
+                set_amax_for_all_moe_layers(block, attr_name="orig_layer.act_max")
             if self.low_cpu_mem_usage:
                 block = block.to(device)
             clear_memory()
@@ -2858,7 +3230,7 @@ class AutoRound(object):
             clear_memory(input_ids)
             return None, output
 
-    def quant_blocks(
+    def quantize_blocks(
         self, model: torch.nn.Module, inputs, block_names, q_input=None, nblocks=1, device="cpu", pbar=None
     ):
         """Quantize and dequantize the weights of the specified blocks in the model.
@@ -2882,7 +3254,7 @@ class AutoRound(object):
         clear_memory()
         input_ids = to_device(input_ids, self.cache_device)
         input_others = to_device(input_others, self.cache_device)
-        ## as in calibration phase, we may use bf16 for calibration due to low_gpu_memory usage
+        # As in calibration phase, we may use bf16 for calibration due to low_gpu_memory usage
         tmp_dtype = self.amp_dtype if self.amp else torch.float32
         for i in range(len(input_ids)):
             input_ids[i] = input_ids[i].to(tmp_dtype)
@@ -2895,10 +3267,35 @@ class AutoRound(object):
             elif isinstance(input_others[key], list):
                 for i in range(len(input_others[key])):
                     to_dtype(input_others[key][i], tmp_dtype)
-        if self.enable_torch_compile:
-            quant_block = compile_func(self.quant_block, device)
+
+        if (
+            self.act_bits > 8
+            and self.sym
+            and self.enable_alg_ext
+            and self.super_group_size is None
+            and self.data_type.startswith("int")
+        ):
+            try:
+                from auto_round.alg_ext import quantize_block_ext
+
+                AutoRound.quantize_block_ext = quantize_block_ext
+                quantize_block = self.quantize_block_ext  ##must use self.quantize_block_ext
+                if self.bits > 2:
+                    logger.warning(
+                        "algorithm extension has only undergone limited validation on INT2; use with caution."
+                    )
+                else:
+                    logger.info("using algorithm extension for quantization.")
+            except (ImportError, ModuleNotFoundError):
+                quantize_block = self.quantize_block
+                if self.enable_torch_compile:
+                    quantize_block = compile_func(quantize_block, device)
+                else:
+                    quantize_block = quantize_block
         else:
-            quant_block = self.quant_block
+            quantize_block = self.quantize_block
+            if self.enable_torch_compile:
+                quantize_block = compile_func(quantize_block, device)
 
         if pbar is None:
             pbar = tqdm(range(0, len(block_names), nblocks))
@@ -2919,7 +3316,7 @@ class AutoRound(object):
             if not self.model.device.type == "meta" or self.low_cpu_mem_usage:
                 m = m.to(device)
 
-            q_input, input_ids = quant_block(
+            q_input, input_ids = quantize_block(
                 m,
                 input_ids,
                 input_others,
@@ -2954,7 +3351,6 @@ class AutoRound(object):
         pbar.set_description("Quantizing done")
         pbar.update(1)
         pbar.close()
-
         self.model = mv_module_from_gpu(self.model, self.low_cpu_mem_usage)
         for n, m in self.model.named_modules():
             if hasattr(m, "name"):
@@ -2987,7 +3383,7 @@ class AutoRound(object):
         if not self.quantized:
             logger.warning("please run autoround.quantize first")
             return
-        if format == "fake" or format == "qdq":  ##TODO fix act quantizaiton later
+        if format == "fake" or format == "qdq":  # TODO fix act quantization later
             self.model = self.model.to("cpu")
             self.model.save_pretrained(output_dir)
             if self.tokenizer is not None:
@@ -3001,6 +3397,8 @@ class AutoRound(object):
                 "Support for exporting activation quantization is limited. "
                 "Please ensure that your configuration is supported."
             )
+        if format == "llmcompressor" and (is_nv_fp(self.data_type) or is_mx_fp(self.data_type)):
+            format = format.replace("llmcompressor", f"llmcompressor:{self.data_type}")
 
         from auto_round.export import EXPORT_FORMAT
 
@@ -3037,6 +3435,7 @@ class AutoRound(object):
             layer_config=self.layer_config,
             inplace=inplace,
             bits=self.bits,
+            act_bits=self.act_bits,
             group_size=self.group_size,
             sym=self.sym,
             iters=self.iters,
@@ -3048,6 +3447,7 @@ class AutoRound(object):
             tokenizer=self.tokenizer,
             supported_types=self.supported_types,
             data_type=self.data_type,
+            act_data_type=self.act_data_type,
             serialization_dict=serialization_dict,
             backend=backend,
             to_quant_block_names=self.to_quant_block_names,
@@ -3109,8 +3509,6 @@ class AutoRound(object):
         Returns:
         The specified optimizer.
         """
-        from auto_round.sign_sgd import SignSGD
-
         return SignSGD
 
     def get_scaler(self):
@@ -3193,7 +3591,7 @@ class AutoRound(object):
         return current_input_ids, current_input_others
 
 
-class AutoRoundOPT(AutoRound):
+class AutoRoundAdam(AutoRound):
     """Class for automatic rounding-based quantization with optimizers like adamw of a PyTorch model.
 
     Args:
@@ -3244,7 +3642,7 @@ class AutoRoundOPT(AutoRound):
 
     def __init__(
         self,
-        model,
+        model: Union[torch.nn.Module, str],
         tokenizer=None,
         bits: int = 4,
         group_size: int = 128,
@@ -3252,7 +3650,7 @@ class AutoRoundOPT(AutoRound):
         layer_config=None,
         batch_size: int = 8,
         amp: bool = True,
-        device=None,
+        device: Union[str, torch.device, int] = 0,
         lr_scheduler=None,
         dataset: Union[str, list, tuple, torch.utils.data.DataLoader] = "NeelNanda/pile-10k",
         enable_quanted_input: bool = True,
@@ -3260,186 +3658,7 @@ class AutoRoundOPT(AutoRound):
         lr: float = None,
         minmax_lr: float = None,
         low_gpu_mem_usage: bool = False,
-        low_cpu_mem_usage: bool = False,
-        iters: int = 200,
-        seqlen: int = 2048,
-        nsamples: int = 128,
-        sampler: str = "rand",
-        seed: int = 42,
-        nblocks: int = 1,
-        gradient_accumulate_steps: int = 1,
-        not_use_best_mse: bool = False,
-        dynamic_max_gap: int = -1,
-        data_type: str = "int",
-        scale_dtype: str = "fp16",
-        act_bits: int = 16,
-        act_group_size: int = None,
-        act_sym: bool = None,
-        act_data_type: str = None,
-        act_dynamic: bool = True,
-        to_quant_block_names: Union[str, list] = None,
-        enable_norm_bias_tuning: bool = False,
-        enable_torch_compile: bool = False,
-        device_map: Union[str, dict] = None,
-        optimizer="AdamW",
-        super_bits: int = None,
-        super_group_size: int = None,
-        disable_opt_rtn: bool = False,
-        **kwargs,
-    ):
-        super(AutoRoundOPT, self).__init__(
-            model=model,
-            tokenizer=tokenizer,
-            bits=bits,
-            group_size=group_size,
-            sym=sym,
-            layer_config=layer_config,
-            batch_size=batch_size,
-            amp=amp,
-            device=device,
-            lr_scheduler=lr_scheduler,
-            dataset=dataset,
-            enable_quanted_input=enable_quanted_input,
-            enable_minmax_tuning=enable_minmax_tuning,
-            lr=lr,
-            minmax_lr=minmax_lr,
-            low_gpu_mem_usage=low_gpu_mem_usage,
-            low_cpu_mem_usage=low_cpu_mem_usage,
-            iters=iters,
-            seqlen=seqlen,
-            nsamples=nsamples,
-            sampler=sampler,
-            seed=seed,
-            nblocks=nblocks,
-            gradient_accumulate_steps=gradient_accumulate_steps,
-            not_use_best_mse=not_use_best_mse,
-            dynamic_max_gap=dynamic_max_gap,
-            data_type=data_type,
-            scale_dtype=scale_dtype,
-            act_bits=act_bits,
-            act_group_size=act_group_size,
-            act_sym=act_sym,
-            act_data_type=act_data_type,
-            act_dynamic=act_dynamic,
-            to_quant_block_names=to_quant_block_names,
-            enable_norm_bias_tuning=enable_norm_bias_tuning,
-            enable_torch_compile=enable_torch_compile,
-            device_map=device_map,
-            super_bits=super_bits,
-            super_group_size=super_group_size,
-            **kwargs,
-        )
-
-        self.optimizer = self.get_optimizer(optimizer)
-
-    def get_optimizer(self, optimizer):
-        if optimizer is None:
-            optimizer = torch.optim.AdamW
-        elif isinstance(optimizer, str):
-            optimizer = getattr(torch.optim, optimizer)
-        else:
-            optimizer = optimizer
-        return optimizer
-
-    def get_scaler(self):
-        scaler = None
-        if self.amp and not check_is_cpu(self.device):
-            from torch.cuda.amp import GradScaler
-
-            scaler = GradScaler(init_scale=1024, growth_interval=100000)
-        return scaler
-
-    def scale_loss_and_backward(self, scaler, loss):
-        if scaler is not None:
-            loss = scaler.scale(loss)
-
-        loss.backward()
-        if is_optimum_habana_available():
-            htcore.mark_step()
-        return loss
-
-    def step(self, scaler, optimizer, lr_schedule):
-        if scaler is not None:
-            scaler.step(optimizer)
-            optimizer.zero_grad()
-            lr_schedule.step()
-            scaler.update()
-        else:
-            optimizer.step()
-            optimizer.zero_grad()
-            lr_schedule.step()
-        if is_optimum_habana_available():
-            htcore.mark_step()
-
-
-class AutoRoundAdam(AutoRoundOPT):
-    """Class for automatic rounding-based quantization with optimizers like adamw of a PyTorch model.
-    The default lr has been changed.
-
-    Args:
-        model: The PyTorch model to be quantized.
-        tokenizer: An optional tokenizer for processing input data.
-        bits (int): Number of bits for quantization (default is 4).
-        group_size (int): Size of the quantization group (default is 128).
-        sym (str): Whether symmetric quantization to be used (default is True).
-        layer_config (dict): Configuration for weight quantization (default is None).
-        batch_size (int): Batch size for training (default is 8).
-        amp (bool): Whether to use automatic mixed precision (default is True).
-        device: The device to be used for training (default is "auto").
-        lr_scheduler: The learning rate scheduler to be used.
-        dataset (Union[str, list, tuple, torch.utils.data.DataLoader]):
-                The default dataset name (default is "NeelNanda/pile-10k").
-        enable_quanted_input (bool): Whether to use quantized input data (default is True).
-        enable_minmax_tuning (bool): Whether to enable min-max tuning (default is True).
-        lr (float): The learning rate (default is 0.005).
-        minmax_lr (float): The learning rate for min-max tuning (default is None).
-        low_gpu_mem_usage (bool): Whether to use low GPU memory (default is False).
-        low_cpu_mem_usage (bool): Whether to use low CPU memory (default is False).
-        iters (int): Number of iterations (default is 200).
-        seqlen (int): Length of the sequence.
-        nsamples (int): Number of samples (default is 128).
-        sampler (str): The sampling method (default is "rand").
-        seed (int): The random seed (default is 42).
-        nblocks (int): Number of blocks (default is 1).
-        gradient_accumulate_steps (int): Number of gradient accumulation steps (default is 1).
-        not_use_best_mse (bool): Whether to use mean squared error (default is False).
-        dynamic_max_gap (int): The dynamic maximum gap (default is -1).
-        data_type (str): The data type to be used (default is "int").
-        optimizer: string or object
-        scale_dtype (str): The data type of quantization scale to be used (default is "float16"), different kernels
-                           have different choices.
-        act_bits (int): Number of bits for activation quantization. Default is 16.
-        act_group_size (int): Group size for activation quantization. Default is None.
-        act_sym (bool): Whether to use symmetric activation quantization. Default is None.
-        act_data_type (str): Specifies the data type for activations.
-                             Defaults to None, in which case it inherits the weight data type.
-        act_dynamic (bool): Whether to use dynamic activation quantization. Default is True.
-        to_quant_block_names (str|list): A list whose elements are list of block's layer names to be quantized.
-        enable_norm_bias_tuning (bool): Whether to enable fast norm/layer_bias tuning
-        enable_torch_compile (bool): Whether to enable torch compile to optimize quant_block/layer function
-    Returns:
-        The quantized model.
-    """
-
-    def __init__(
-        self,
-        model,
-        tokenizer=None,
-        bits: int = 4,
-        group_size: int = 128,
-        sym: bool = True,
-        layer_config=None,
-        batch_size: int = 8,
-        amp: bool = True,
-        device=None,
-        lr_scheduler=None,
-        dataset: Union[str, list, tuple, torch.utils.data.DataLoader] = "NeelNanda/pile-10k",
-        enable_quanted_input: bool = True,
-        enable_minmax_tuning: bool = True,
-        lr: float = None,
-        minmax_lr: float = None,
-        low_gpu_mem_usage: bool = False,
-        low_cpu_mem_usage: bool = False,
+        low_cpu_mem_usage: int = 0,
         iters: int = 200,
         seqlen: int = 2048,
         nsamples: int = 128,
@@ -3504,8 +3723,49 @@ class AutoRoundAdam(AutoRoundOPT):
             enable_norm_bias_tuning=enable_norm_bias_tuning,
             enable_torch_compile=enable_torch_compile,
             device_map=device_map,
-            optimizer=optimizer,
             super_bits=super_bits,
             super_group_size=super_group_size,
+            disable_opt_rtn=disable_opt_rtn,
             **kwargs,
         )
+
+        self.optimizer = self.get_optimizer(optimizer)
+
+    def get_optimizer(self, optimizer):
+        if optimizer is None:
+            optimizer = torch.optim.AdamW
+        elif isinstance(optimizer, str):
+            optimizer = getattr(torch.optim, optimizer)
+        else:
+            optimizer = optimizer
+        return optimizer
+
+    def get_scaler(self):
+        scaler = None
+        if self.amp and not check_is_cpu(self.device):
+            from torch.cuda.amp import GradScaler
+
+            scaler = GradScaler(init_scale=1024, growth_interval=100000)
+        return scaler
+
+    def scale_loss_and_backward(self, scaler, loss):
+        if scaler is not None:
+            loss = scaler.scale(loss)
+
+        loss.backward()
+        if is_optimum_habana_available():
+            htcore.mark_step()
+        return loss
+
+    def step(self, scaler, optimizer, lr_schedule):
+        if scaler is not None:
+            scaler.step(optimizer)
+            optimizer.zero_grad()
+            lr_schedule.step()
+            scaler.update()
+        else:
+            optimizer.step()
+            optimizer.zero_grad()
+            lr_schedule.step()
+        if is_optimum_habana_available():
+            htcore.mark_step()
